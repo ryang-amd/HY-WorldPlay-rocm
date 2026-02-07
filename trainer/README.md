@@ -2,7 +2,34 @@
 
 We provide a detailed guideline, including dataset structure and training scripts, to train the base model on your own dataset. Specifically, now we only support the autoregressive training with action control and memory design based on HunyuanVideo 1.5.
 
+## Prepare ROCm environment
+
+Install the ROCK pacakge with torch dependencies:
+```
+conda activate hunyuan
+bash install_rock_nightlies.sh 20250930
+source setup_rock_env.sh
+```
+
+Comment out torch related installations and install without dependencies
+```
+pip install -r requirements.txt
+pip install --no-deps accelerate diffusers transformers peft
+```
+
+
+
 ## Prepare the Dataset
+Run the following:
+```
+HIP_VISIBLE_DEVICES=7 python scripts/preprocess_vkitti_for_training.py \
+    --data_root /data/ruijyang/datasets/mast3r_data/processed_vkitti \
+    --model_path /data/ruijyang/pretrained_models/hunyuanwp/HunyuanVideo-1.5 \
+    --output_dir /data/ruijyang/datasets/vkitti_training_data_full \
+    --height 480 \
+    --width 832 
+```
+
 The json file structure is presented as below:
 
 ```
