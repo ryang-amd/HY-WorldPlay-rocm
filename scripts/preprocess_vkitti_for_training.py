@@ -78,22 +78,17 @@ def parse_args():
                         help="Path to HunyuanVideo-1.5 pretrained model directory")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for preprocessed training data")
-    parser.add_argument("--num_frames", type=int, default=113,
-                        help="Number of video frames per clip (must satisfy (num_frames-1)%%4==0 for VAE). "
-                             "113 frames -> 29 latent frames. Default: 113")
+    parser.add_argument("--max_frames", type=int, default=None,
+                        help="Maximum number of video frames to use per sequence. "
+                             "If not specified, uses all available frames (truncated to valid VAE length). "
+                             "Must satisfy (n-1)%%4==0 for VAE compatibility.")
     parser.add_argument("--height", type=int, default=480,
                         help="Target height for video frames (default: 480)")
     parser.add_argument("--width", type=int, default=832,
                         help="Target width for video frames (default: 832)")
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Override: use this single text prompt for ALL clips "
+                        help="Override: use this single text prompt for ALL sequences "
                              "(default: auto-generate per scene/condition)")
-    parser.add_argument("--stride", type=int, default=1,
-                        help="Frame stride when sampling from the original sequence (default: 1)")
-    parser.add_argument("--clip_stride", type=int, default=56,
-                        help="Stride between clip start positions (default: 56, for overlapping clips)")
-    parser.add_argument("--max_clips_per_sequence", type=int, default=None,
-                        help="Max clips to extract per sequence (default: all)")
     parser.add_argument("--scenes", type=str, nargs="*", default=None,
                         help="Specific scenes to process (default: all)")
     parser.add_argument("--conditions", type=str, nargs="*", default=None,
@@ -501,107 +496,106 @@ def main():
     torch.cuda.empty_cache()
 
     # ---------------------------------------------------------------
-    # 4. Process each sequence
+    # 4. Process each sequence (one latent per full video)
     # ---------------------------------------------------------------
     training_entries = []
-    clip_id = 0
+    processed_count = 0
 
     for seq_idx, seq in enumerate(tqdm(sequences, desc="Sequences")):
         seq_path = seq["path"]
         frame_indices = seq["frame_indices"]
         seq_name = f"{seq['scene']}_{seq['condition']}_{seq['camera']}"
         
-        print(f"\n[{seq_idx+1}/{len(sequences)}] Processing {seq_name} ({len(frame_indices)} frames)")
+        total_frames = len(frame_indices)
+        
+        # Find the maximum valid frame count: (n-1) % 4 == 0
+        if args.max_frames:
+            max_allowed = min(args.max_frames, total_frames)
+        else:
+            max_allowed = total_frames
+        
+        # Find largest valid n <= max_allowed
+        num_frames = max_allowed
+        while num_frames > 0 and (num_frames - 1) % 4 != 0:
+            num_frames -= 1
+        
+        if num_frames < 5:  # Need at least 5 frames for meaningful video
+            print(f"\n[{seq_idx+1}/{len(sequences)}] Skipping {seq_name}: only {total_frames} frames available")
+            continue
+        
+        # Number of latent frames after VAE temporal compression (4x)
+        num_latent_frames = (num_frames - 1) // 4 + 1
+        
+        print(f"\n[{seq_idx+1}/{len(sequences)}] Processing {seq_name}")
+        print(f"  Available: {total_frames} frames -> Using: {num_frames} frames -> {num_latent_frames} latent frames")
 
         # Look up the correct prompt for this sequence
         if args.prompt:
-            clip_prompt = args.prompt
+            seq_prompt = args.prompt
         else:
-            clip_prompt = get_prompt(seq["scene"], seq["condition"])
-        prompt_embeds, prompt_mask, byt5_text_states, byt5_text_mask = prompt_cache[clip_prompt]
+            seq_prompt = get_prompt(seq["scene"], seq["condition"])
+        prompt_embeds, prompt_mask, byt5_text_states, byt5_text_mask = prompt_cache[seq_prompt]
 
-        # Calculate how many clips we can extract
-        num_clips = max(1, (len(frame_indices) - args.num_frames) // args.clip_stride + 1)
-        if args.max_clips_per_sequence:
-            num_clips = min(num_clips, args.max_clips_per_sequence)
+        # Use first num_frames frames
+        used_frame_indices = frame_indices[:num_frames]
 
-        if len(frame_indices) < args.num_frames:
-            print(f"  Skipping {seq_name}: only {len(frame_indices)} frames < {args.num_frames}")
+        try:
+            # --- Load video frames ---
+            print(f"  Loading {num_frames} frames...", end=" ", flush=True)
+            video_frames = load_frames(seq_path, used_frame_indices, args.height, args.width)
+            print(f"Done. Shape: {video_frames.shape}")
+
+            # --- Load cameras (one per latent frame) ---
+            # Latent frame i corresponds to original frame index:
+            #   i=0 -> used_frame_indices[0]
+            #   i=1 -> used_frame_indices[4]
+            #   i=k -> used_frame_indices[4*k]
+            latent_frame_original_indices = [used_frame_indices[min(4 * k, len(used_frame_indices) - 1)]
+                                              for k in range(num_latent_frames)]
+            intrinsics, c2w_matrices = load_cameras(seq_path, latent_frame_original_indices)
+
+            # --- VAE encode video ---
+            print(f"  VAE encoding...", end=" ", flush=True)
+            latent = encode_video_vae(vae, video_frames, device)
+            print(f"Done. Latent shape: {latent.shape}")
+
+            # --- VAE encode first frame (image conditioning) ---
+            image_cond = encode_first_frame_vae(vae, video_frames, device)
+
+            # --- SigLIP encode first frame (vision states) ---
+            first_frame_np = (video_frames[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            first_frame_np = first_frame_np[np.newaxis, ...]  # (1, H, W, 3)
+            vision_states = encode_vision_siglip(vision_encoder, first_frame_np, device)
+
+            # --- Save latent .pt ---
+            latent_path = os.path.join(latent_dir, f"{seq_name}.pt")
+            torch.save({
+                "latent": latent,
+                "prompt_embeds": prompt_embeds,
+                "prompt_mask": prompt_mask,
+                "image_cond": image_cond,
+                "vision_states": vision_states,
+                "byt5_text_states": byt5_text_states,
+                "byt5_text_mask": byt5_text_mask,
+            }, latent_path)
+
+            # --- Save pose .json ---
+            pose_dict = make_pose_json(intrinsics, c2w_matrices)
+            pose_path = os.path.join(pose_dir, f"{seq_name}_pose.json")
+            with open(pose_path, "w") as f:
+                json.dump(pose_dict, f)
+
+            training_entries.append({
+                "latent_path": os.path.abspath(latent_path),
+                "pose_path": os.path.abspath(pose_path),
+            })
+            processed_count += 1
+
+        except Exception as e:
+            print(f"  Error processing {seq_name}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
-        
-        print(f"  Will extract {num_clips} clips")
-
-        for clip_i in range(num_clips):
-            start = clip_i * args.clip_stride
-            clip_frame_indices = frame_indices[start:start + args.num_frames:args.stride]
-
-            if len(clip_frame_indices) < args.num_frames // args.stride:
-                break
-
-            actual_num_frames = len(clip_frame_indices)
-            # Number of latent frames after VAE temporal compression (4x)
-            num_latent_frames = (actual_num_frames - 1) // 4 + 1
-            
-            print(f"    Clip {clip_i+1}/{num_clips}: frames {clip_frame_indices[0]}-{clip_frame_indices[-1]}")
-
-            try:
-                # --- Load video frames ---
-                print(f"      Loading {actual_num_frames} frames...", end=" ", flush=True)
-                video_frames = load_frames(seq_path, clip_frame_indices, args.height, args.width)
-                print(f"Done. Shape: {video_frames.shape}")
-
-                # --- Load cameras (one per latent frame) ---
-                # Latent frame i corresponds to original frame index:
-                #   i=0 -> clip_frame_indices[0]
-                #   i=1 -> clip_frame_indices[4]
-                #   i=k -> clip_frame_indices[4*k]
-                latent_frame_original_indices = [clip_frame_indices[min(4 * k, len(clip_frame_indices) - 1)]
-                                                  for k in range(num_latent_frames)]
-                intrinsics, c2w_matrices = load_cameras(seq_path, latent_frame_original_indices)
-
-                # --- VAE encode video ---
-                print(f"      VAE encoding...", end=" ", flush=True)
-                latent = encode_video_vae(vae, video_frames, device)
-                print(f"Done. Latent shape: {latent.shape}")
-
-                # --- VAE encode first frame (image conditioning) ---
-                image_cond = encode_first_frame_vae(vae, video_frames, device)
-
-                # --- SigLIP encode first frame (vision states) ---
-                first_frame_np = (video_frames[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                first_frame_np = first_frame_np[np.newaxis, ...]  # (1, H, W, 3)
-                vision_states = encode_vision_siglip(vision_encoder, first_frame_np, device)
-
-                # --- Save latent .pt ---
-                clip_name = f"{seq_name}_clip{clip_i:04d}"
-                latent_path = os.path.join(latent_dir, f"{clip_name}.pt")
-                torch.save({
-                    "latent": latent,
-                    "prompt_embeds": prompt_embeds,
-                    "prompt_mask": prompt_mask,
-                    "image_cond": image_cond,
-                    "vision_states": vision_states,
-                    "byt5_text_states": byt5_text_states,
-                    "byt5_text_mask": byt5_text_mask,
-                }, latent_path)
-
-                # --- Save pose .json ---
-                pose_dict = make_pose_json(intrinsics, c2w_matrices)
-                pose_path = os.path.join(pose_dir, f"{clip_name}_pose.json")
-                with open(pose_path, "w") as f:
-                    json.dump(pose_dict, f)
-
-                training_entries.append({
-                    "latent_path": os.path.abspath(latent_path),
-                    "pose_path": os.path.abspath(pose_path),
-                })
-                clip_id += 1
-
-            except Exception as e:
-                print(f"  Error processing {seq_name} clip {clip_i}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
 
         # Free memory periodically
         torch.cuda.empty_cache()
@@ -613,7 +607,7 @@ def main():
     with open(train_json_path, "w") as f:
         json.dump(training_entries, f, indent=2)
 
-    print(f"\nDone! Processed {clip_id} clips from {len(sequences)} sequences.")
+    print(f"\nDone! Processed {processed_count} sequences.")
     print(f"Training JSON: {train_json_path}")
     print(f"Negative prompt: {neg_prompt_path}")
     print(f"Negative byT5:   {neg_byt5_path}")

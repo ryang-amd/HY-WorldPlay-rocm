@@ -21,6 +21,11 @@ import os
 import sys
 from pathlib import Path
 
+# Add project root to path so we can import hyvideo
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent
+sys.path.insert(0, str(project_root))
+
 import torch
 import numpy as np
 
@@ -31,12 +36,15 @@ def parse_args():
                         help="Path to preprocessed data directory")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print detailed info for each file")
-    parser.add_argument("--decode_latent", action="store_true",
-                        help="Decode a sample latent back to video (requires VAE)")
+    parser.add_argument("--decode_latent", type=str, nargs="?", const="random",
+                        help="Decode latent back to video. Specify a name (e.g., 'Scene01_clone_Camera_0') "
+                             "or use without value for random selection.")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to HunyuanVideo model (required for --decode_latent)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Max number of samples to check (default: all)")
+    parser.add_argument("--save_video", action="store_true",
+                        help="Save decoded output as MP4 video (default: save as frames)")
     return parser.parse_args()
 
 
@@ -193,13 +201,8 @@ def verify_pose_file(pose_path, verbose=False):
     return issues
 
 
-def decode_and_visualize(pt_path, model_path, output_dir):
-    """Decode a latent back to video frames for visual verification."""
-    from PIL import Image
-    
-    print(f"\nDecoding latent from {pt_path}...")
-    
-    # Load VAE
+def load_vae(model_path, device):
+    """Load VAE model once for reuse."""
     from hyvideo.models.autoencoders.hunyuanvideo_15_vae_w_cache import AutoencoderKLConv3D
     from safetensors.torch import load_file as load_safetensors
     
@@ -215,10 +218,18 @@ def decode_and_visualize(pt_path, model_path, output_dir):
     vae = AutoencoderKLConv3D(**vae_config)
     vae_state_dict = load_safetensors(vae_ckpt_path)
     vae.load_state_dict(vae_state_dict, strict=True)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vae = vae.to(device=device, dtype=torch.float16)
     vae.eval()
+    return vae
+
+
+def decode_and_visualize(pt_path, vae, output_dir, save_video=False):
+    """Decode a latent back to video frames for visual verification."""
+    from PIL import Image
+    
+    device = next(vae.parameters()).device
+    clip_name = Path(pt_path).stem
+    print(f"\nDecoding: {clip_name}")
     
     # Load latent
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
@@ -239,18 +250,31 @@ def decode_and_visualize(pt_path, model_path, output_dir):
     decoded = decoded.clamp(0, 1)
     decoded = (decoded * 255).to(torch.uint8).cpu().numpy()
     
-    # Save frames
-    clip_name = Path(pt_path).stem
-    out_subdir = os.path.join(output_dir, f"decoded_{clip_name}")
-    os.makedirs(out_subdir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
-    print(f"  Saving {decoded.shape[0]} decoded frames to {out_subdir}")
-    for i, frame in enumerate(decoded):
-        frame = frame.transpose(1, 2, 0)  # (H, W, C)
-        img = Image.fromarray(frame)
-        img.save(os.path.join(out_subdir, f"frame_{i:04d}.png"))
+    if save_video:
+        # Save as MP4 video
+        try:
+            import imageio
+            video_path = os.path.join(output_dir, f"decoded_{clip_name}.mp4")
+            frames = [frame.transpose(1, 2, 0) for frame in decoded]  # (H, W, C)
+            imageio.mimsave(video_path, frames, fps=24)
+            print(f"  Saved video: {video_path} ({len(frames)} frames)")
+        except ImportError:
+            print("  ERROR: imageio not installed. Install with: pip install imageio imageio-ffmpeg")
+            save_video = False
     
-    print(f"  Done! Check {out_subdir}")
+    if not save_video:
+        # Save as individual frames
+        out_subdir = os.path.join(output_dir, f"decoded_{clip_name}")
+        os.makedirs(out_subdir, exist_ok=True)
+        
+        print(f"  Saving {decoded.shape[0]} frames to {out_subdir}")
+        for i, frame in enumerate(decoded):
+            frame = frame.transpose(1, 2, 0)  # (H, W, C)
+            img = Image.fromarray(frame)
+            img.save(os.path.join(out_subdir, f"frame_{i:04d}.png"))
+        print(f"  Done! Check {out_subdir}")
 
 
 def main():
@@ -390,12 +414,39 @@ def main():
         if not args.model_path:
             print("ERROR: --model_path required for --decode_latent")
             sys.exit(1)
-        if len(latent_files) > 0:
-            decode_and_visualize(
-                latent_files[0], 
-                args.model_path, 
-                str(data_dir / "verification")
-            )
+        if len(latent_files) == 0:
+            print("ERROR: No latent files found")
+            sys.exit(1)
+        
+        # Find the file to decode
+        if args.decode_latent == "random":
+            import random
+            selected_file = random.choice(latent_files)
+            print(f"\n=== Randomly Selected: {selected_file.stem} ===")
+        else:
+            # User specified a name - find matching file
+            search_name = args.decode_latent
+            matching = [f for f in latent_files if search_name in f.stem]
+            if not matching:
+                print(f"ERROR: No latent file matching '{search_name}' found.")
+                print(f"Available files (first 10):")
+                for f in latent_files[:10]:
+                    print(f"  - {f.stem}")
+                sys.exit(1)
+            selected_file = matching[0]
+            if len(matching) > 1:
+                print(f"Multiple matches found, using first: {selected_file.stem}")
+            print(f"\n=== Decoding: {selected_file.stem} ===")
+        
+        # Load VAE
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading VAE on {device}...")
+        vae = load_vae(args.model_path, device)
+        
+        output_dir = str(data_dir / "verification")
+        decode_and_visualize(selected_file, vae, output_dir, save_video=args.save_video)
+        
+        print(f"\nDecoded files saved to: {output_dir}")
     
     # Summary
     print("=== Summary ===")
