@@ -1,4 +1,12 @@
 # ============================================================
+# Load environment variables (WandB credentials, etc.)
+# ============================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../../../.env" ]; then
+    source "${SCRIPT_DIR}/../../../.env"
+fi
+
+# ============================================================
 # Paths to pretrained models (downloaded via download_models.py)
 # ============================================================
 MODEL_PATH=/data/ruijyang/pretrained_models/hunyuanwp/HunyuanVideo-1.5
