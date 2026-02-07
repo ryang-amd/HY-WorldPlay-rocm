@@ -4,7 +4,7 @@ Download script for HY-WorldPlay models.
 Downloads all required models from HuggingFace and ModelScope.
 
 Usage:
-    python download_models.py --hf_token <your_token>
+    python download_models.py --hf_token <your_token> --local_dir /data/ruijyang/pretrained_models/hunyuanwp
 
 The HF token is required for downloading the vision encoder from FLUX.1-Redux-dev.
 Request access at: https://huggingface.co/black-forest-labs/FLUX.1-Redux-dev
@@ -31,7 +31,7 @@ def check_dependencies():
         os.system("pip install modelscope")
 
 
-def download_hy_worldplay():
+def download_hy_worldplay(local_dir=None):
     """Download HY-WorldPlay action models."""
     from huggingface_hub import snapshot_download
 
@@ -39,7 +39,11 @@ def download_hy_worldplay():
     print("[1/6] Downloading tencent/HY-WorldPlay...")
     print("=" * 60)
 
-    worldplay_path = snapshot_download("tencent/HY-WorldPlay")
+    dl_kwargs = {}
+    if local_dir:
+        dl_kwargs["local_dir"] = os.path.join(local_dir, "HY-WorldPlay")
+
+    worldplay_path = snapshot_download("tencent/HY-WorldPlay", **dl_kwargs)
     print(f"Downloaded to: {worldplay_path}")
 
     # Fix: Rename model.safetensors to diffusion_pytorch_model.safetensors
@@ -58,7 +62,7 @@ def download_hy_worldplay():
     return worldplay_path
 
 
-def download_hunyuan_video():
+def download_hunyuan_video(local_dir=None):
     """Download HunyuanVideo-1.5 base models (vae, scheduler, transformer)."""
     from huggingface_hub import snapshot_download
 
@@ -66,15 +70,20 @@ def download_hunyuan_video():
     print("[2/6] Downloading tencent/HunyuanVideo-1.5 (vae, scheduler, transformer)...")
     print("=" * 60)
 
+    dl_kwargs = {}
+    if local_dir:
+        dl_kwargs["local_dir"] = os.path.join(local_dir, "HunyuanVideo-1.5")
+
     hunyuan_path = snapshot_download(
         "tencent/HunyuanVideo-1.5",
         allow_patterns=["vae/*", "scheduler/*", "transformer/480p_i2v/*"],
+        **dl_kwargs,
     )
     print(f"Downloaded to: {hunyuan_path}")
     return hunyuan_path
 
 
-def download_llm_text_encoder(hunyuan_path):
+def download_llm_text_encoder(hunyuan_path, local_dir=None):
     """Download Qwen2.5-VL-7B-Instruct as the LLM text encoder."""
     from huggingface_hub import snapshot_download
 
@@ -101,23 +110,29 @@ def download_llm_text_encoder(hunyuan_path):
     elif os.path.exists(llm_target):
         shutil.rmtree(llm_target)
 
-    print("Downloading Qwen/Qwen2.5-VL-7B-Instruct (~15GB)...")
-    qwen_cache = snapshot_download("Qwen/Qwen2.5-VL-7B-Instruct")
+    if local_dir:
+        # Download directly into the target directory
+        print("Downloading Qwen/Qwen2.5-VL-7B-Instruct (~15GB)...")
+        snapshot_download("Qwen/Qwen2.5-VL-7B-Instruct", local_dir=llm_target)
+        print(f"Downloaded to: {llm_target}")
+    else:
+        print("Downloading Qwen/Qwen2.5-VL-7B-Instruct (~15GB)...")
+        qwen_cache = snapshot_download("Qwen/Qwen2.5-VL-7B-Instruct")
 
-    # Copy files (resolve symlinks)
-    os.makedirs(llm_target, exist_ok=True)
-    for item in os.listdir(qwen_cache):
-        src = os.path.realpath(os.path.join(qwen_cache, item))
-        dst = os.path.join(llm_target, item)
-        if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-        else:
-            shutil.copy2(src, dst)
+        # Copy files (resolve symlinks)
+        os.makedirs(llm_target, exist_ok=True)
+        for item in os.listdir(qwen_cache):
+            src = os.path.realpath(os.path.join(qwen_cache, item))
+            dst = os.path.join(llm_target, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
 
-    print(f"Copied to: {llm_target}")
+        print(f"Copied to: {llm_target}")
 
 
-def download_byt5_encoders(hunyuan_path):
+def download_byt5_encoders(hunyuan_path, local_dir=None):
     """Download ByT5 text encoders (byt5-small and Glyph-SDXL-v2)."""
     from huggingface_hub import snapshot_download
     from modelscope import snapshot_download as ms_snapshot_download
@@ -143,18 +158,23 @@ def download_byt5_encoders(hunyuan_path):
         elif os.path.exists(byt5_target):
             shutil.rmtree(byt5_target)
 
-        print("Downloading google/byt5-small...")
-        byt5_cache = snapshot_download("google/byt5-small")
+        if local_dir:
+            print("Downloading google/byt5-small...")
+            snapshot_download("google/byt5-small", local_dir=byt5_target)
+            print(f"Downloaded to: {byt5_target}")
+        else:
+            print("Downloading google/byt5-small...")
+            byt5_cache = snapshot_download("google/byt5-small")
 
-        os.makedirs(byt5_target, exist_ok=True)
-        for item in os.listdir(byt5_cache):
-            src = os.path.realpath(os.path.join(byt5_cache, item))
-            dst = os.path.join(byt5_target, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-        print(f"Copied to: {byt5_target}")
+            os.makedirs(byt5_target, exist_ok=True)
+            for item in os.listdir(byt5_cache):
+                src = os.path.realpath(os.path.join(byt5_cache, item))
+                dst = os.path.join(byt5_target, item)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+            print(f"Copied to: {byt5_target}")
 
     # 2. Download Glyph-SDXL-v2 from ModelScope
     glyph_target = os.path.join(text_encoder_base, "Glyph-SDXL-v2")
@@ -184,7 +204,7 @@ def download_byt5_encoders(hunyuan_path):
         print(f"Copied to: {glyph_target}")
 
 
-def download_vision_encoder(hunyuan_path, hf_token):
+def download_vision_encoder(hunyuan_path, hf_token, local_dir=None):
     """Download SigLIP vision encoder from FLUX.1-Redux-dev."""
     from huggingface_hub import snapshot_download
 
@@ -222,20 +242,28 @@ def download_vision_encoder(hunyuan_path, hf_token):
 
     print("Downloading black-forest-labs/FLUX.1-Redux-dev...")
     try:
-        flux_cache = snapshot_download(
-            "black-forest-labs/FLUX.1-Redux-dev", token=hf_token
-        )
+        if local_dir:
+            snapshot_download(
+                "black-forest-labs/FLUX.1-Redux-dev",
+                token=hf_token,
+                local_dir=siglip_target,
+            )
+            print(f"Downloaded to: {siglip_target}")
+        else:
+            flux_cache = snapshot_download(
+                "black-forest-labs/FLUX.1-Redux-dev", token=hf_token
+            )
 
-        # Copy files (resolve symlinks)
-        os.makedirs(siglip_target, exist_ok=True)
-        for item in os.listdir(flux_cache):
-            src = os.path.realpath(os.path.join(flux_cache, item))
-            dst = os.path.join(siglip_target, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-        print(f"Copied to: {siglip_target}")
+            # Copy files (resolve symlinks)
+            os.makedirs(siglip_target, exist_ok=True)
+            for item in os.listdir(flux_cache):
+                src = os.path.realpath(os.path.join(flux_cache, item))
+                dst = os.path.join(siglip_target, item)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+            print(f"Copied to: {siglip_target}")
     except Exception as e:
         print(f"ERROR: Failed to download vision encoder: {e}")
         print(
@@ -243,16 +271,11 @@ def download_vision_encoder(hunyuan_path, hf_token):
         )
 
 
-def print_paths():
+def print_paths(hunyuan_path, worldplay_path):
     """Print the model paths for run.sh configuration."""
-    from huggingface_hub import snapshot_download
-
     print("\n" + "=" * 60)
     print("[6/6] Verifying downloads...")
     print("=" * 60)
-
-    hunyuan_path = snapshot_download("tencent/HunyuanVideo-1.5", local_files_only=True)
-    worldplay_path = snapshot_download("tencent/HY-WorldPlay", local_files_only=True)
 
     print("\n" + "=" * 60)
     print("ALL DOWNLOADS COMPLETE!")
@@ -277,7 +300,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-    python download_models.py --hf_token hf_xxxxxxxxxxxxx
+    python download_models.py --hf_token hf_xxxxxxxxxxxxx --local_dir /data/ruijyang/pretrained_models/hunyuanwp
 
 Note:
     The HuggingFace token is required for downloading the vision encoder
@@ -298,6 +321,13 @@ Note:
         action="store_true",
         help="Skip downloading the vision encoder (if you don't have FLUX access yet)",
     )
+    parser.add_argument(
+        "--local_dir",
+        type=str,
+        default=None,
+        help="Local directory to save all downloaded models to (e.g. /data/ruijyang/pretrained_models/hunyuanwp). "
+        "If not specified, models are saved to the default HuggingFace cache.",
+    )
 
     args = parser.parse_args()
 
@@ -305,22 +335,27 @@ Note:
     print("HY-WorldPlay Model Download Script")
     print("=" * 60)
 
+    if args.local_dir:
+        args.local_dir = os.path.abspath(args.local_dir)
+        os.makedirs(args.local_dir, exist_ok=True)
+        print(f"Saving models to: {args.local_dir}")
+
     # Check dependencies
     check_dependencies()
 
     # Download models
-    worldplay_path = download_hy_worldplay()
-    hunyuan_path = download_hunyuan_video()
-    download_llm_text_encoder(hunyuan_path)
-    download_byt5_encoders(hunyuan_path)
+    worldplay_path = download_hy_worldplay(local_dir=args.local_dir)
+    hunyuan_path = download_hunyuan_video(local_dir=args.local_dir)
+    download_llm_text_encoder(hunyuan_path, local_dir=args.local_dir)
+    download_byt5_encoders(hunyuan_path, local_dir=args.local_dir)
 
     if not args.skip_vision_encoder:
-        download_vision_encoder(hunyuan_path, args.hf_token)
+        download_vision_encoder(hunyuan_path, args.hf_token, local_dir=args.local_dir)
     else:
         print("\n[5/6] Skipping vision encoder download (--skip_vision_encoder flag)")
 
     # Print final paths
-    print_paths()
+    print_paths(hunyuan_path, worldplay_path)
 
 
 if __name__ == "__main__":
