@@ -9,7 +9,7 @@ echo "=== Working in temporary directory: ${WORK_DIR} ==="
 cd "${WORK_DIR}"
 
 # Set up ROCm environment
-source "${SCRIPT_DIR}/HY-WorldPlay-rocm/setup_rock_env.sh"
+source "${SCRIPT_DIR}/setup_rock_env.sh"
 
 # Uninstall old flash-attn if present
 pip uninstall -y flash-attn 2>/dev/null || true

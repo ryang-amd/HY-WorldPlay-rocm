@@ -55,6 +55,20 @@ pip install -r requirements.txt
 ```
 
 ## Running Training Scripts
+
+First setup wandb token and username by setting the environment variable.
+Setting it in the project directory, with ```.env``` and update the following:
+```bash
+# WandB credentials — DO NOT commit this file
+WANDB_API_KEY=xxx
+WANDB_ENTITY=xxx
+
+```
+Then in the terminal, (this has been already integrated into the training script)
+```
+source .env
+```
+
 We provide a training command on a single node as below:
 
 ```
