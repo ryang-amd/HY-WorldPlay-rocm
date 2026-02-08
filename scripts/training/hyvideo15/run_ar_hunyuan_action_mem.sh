@@ -17,8 +17,9 @@ export HUNYUAN_NEG_PROMPT_PATH=/data/ruijyang/datasets/vkitti_training_data_full
 export HUNYUAN_NEG_BYT5_PROMPT_PATH=/data/ruijyang/datasets/vkitti_training_data_full/hunyuan_neg_byt5_prompt.pt
 
 export WANDB_BASE_URL="https://api.wandb.ai"
-export WANDB_MODE=online  # Change to "offline" if no internet, then sync later with: wandb sync
+export WANDB_MODE=online
 export TOKENIZERS_PARALLELISM=false
+# Use TORCH_SDPA since flash_attn is not installed on ROCm
 # export TRAINER_ATTENTION_BACKEND=TORCH_SDPA
 
 # ============================================================
@@ -28,8 +29,6 @@ NUM_GPUS=8
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Training arguments
-# Batch size calculation: (num_gpus / sp_size) × gradient_accumulation × train_sp_batch_size
-# With 8 GPUs, sp_size=4: (8/4) × 4 × 4 = 32
 training_args=(
   --json_path /data/ruijyang/datasets/vkitti_training_data_full/train.json
   --causal
@@ -37,14 +36,14 @@ training_args=(
   --i2v_rate 0.2
   --train_time_shift 3.0
   --window_frames 24
-  --wandb_key "${WANDB_API_KEY}"      # Set via: export WANDB_API_KEY=your_key or in .env file
-  --wandb_entity "${WANDB_ENTITY}"  # Set in .env file
-  --tracker_project_name "hunyuan-worldplay-vkitti"
-  --output_dir /data/ruijyang/experiments/hunyuan_worldplay_vkitti
-  --max_train_steps 10000
-  --train_batch_size 4
-  --train_sp_batch_size 4
-  --gradient_accumulation_steps 4
+  --wandb_key "${WANDB_API_KEY}"
+  --wandb_entity "${WANDB_ENTITY}"
+  --tracker_project_name "hy-worldplay-vkitti"
+  --output_dir /data/ruijyang/training_output/hy_worldplay_vkitti
+  --max_train_steps 5000
+  --train_batch_size 1
+  --train_sp_batch_size 1
+  --gradient_accumulation_steps 1
   --num_latent_t 9
   --num_height 480
   --num_width 832
@@ -66,18 +65,23 @@ parallel_args=(
 )
 
 # Model arguments
+# load_from_dir: AR model directory (has config.json with AR-specific architecture)
+# ar_action_load_from_dir: full model weights including action params
+# NOTE: Using ar_model (non-distilled, 50-step) instead of ar_distilled_action_model (4-step)
+#       for better training gradients. The distilled model is optimized for fast inference,
+#       not for training. Both have the same action parameters, but ar_model has weights
+#       trained with full diffusion steps.
 model_args=(
   --cls_name "HunyuanTransformer3DARActionModel"
-  --load_from_dir ${MODEL_PATH}/transformer/480p_i2v
+  --load_from_dir ${WORLDPLAY_PATH}/ar_model
   --ar_action_load_from_dir ${WORLDPLAY_PATH}/ar_model/diffusion_pytorch_model.safetensors
   --model_path $MODEL_PATH
   --pretrained_model_name_or_path $MODEL_PATH
 )
 
 # Dataset arguments
-# NOTE: On ROCm, num_workers > 0 can cause segfaults due to multiprocessing issues.
-# Start with 0, increase to 1 or 2 if stable.
 dataset_args=(
+  --data-path /data/ruijyang/datasets/vkitti_training_data_full
   --dataloader_num_workers 1
 )
 
@@ -91,7 +95,7 @@ validation_args=(
 
 # Optimizer arguments
 optimizer_args=(
-  --learning_rate 1e-5
+  --learning_rate 1e-4
   --mixed_precision "bf16"
   --checkpointing_steps 500
   --weight_decay 1e-4
@@ -108,7 +112,6 @@ miscellaneous_args=(
   --dit_precision "fp32"
   --num_euler_timesteps 50
   --ema_start_step 0
-#  --enable_gradient_checkpointing_type "full"
 )
 
 export MASTER_PORT=29611
