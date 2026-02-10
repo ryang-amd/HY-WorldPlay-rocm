@@ -19,6 +19,8 @@ export HUNYUAN_NEG_BYT5_PROMPT_PATH=/data/ruijyang/datasets/vkitti_training_data
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 export TOKENIZERS_PARALLELISM=false
+# Force unbuffered Python output for real-time logging
+export PYTHONUNBUFFERED=1
 # Use TORCH_SDPA since flash_attn is not installed on ROCm
 # export TRAINER_ATTENTION_BACKEND=TORCH_SDPA
 
@@ -35,12 +37,12 @@ training_args=(
   --action
   --i2v_rate 0.2
   --train_time_shift 3.0
-  --window_frames 24
+  --window_frames 32
   --wandb_key "${WANDB_API_KEY}"
   --wandb_entity "${WANDB_ENTITY}"
   --tracker_project_name "hy-worldplay-vkitti"
-  --output_dir /data/ruijyang/training_output/hy_worldplay_vkitti
-  --max_train_steps 5000
+  --output_dir /data/ruijyang/training_output/hy_worldplay_vkitti_1.5k_converg
+  --max_train_steps 1500
   --train_batch_size 1
   --train_sp_batch_size 1
   --gradient_accumulation_steps 1
@@ -94,10 +96,15 @@ validation_args=(
 )
 
 # Optimizer arguments
+# Using cosine LR schedule with warmup for better convergence
+# Lower learning rate (5e-5) to reduce oscillation and enable finer optimization
 optimizer_args=(
-  --learning_rate 1e-4
+  --learning_rate 1e-5
+  --lr_scheduler "cosine_with_min_lr"
+  --lr_warmup_steps 20
+  --min_lr_ratio 0.1
   --mixed_precision "bf16"
-  --checkpointing_steps 500
+  --checkpointing_steps 100
   --weight_decay 1e-4
   --max_grad_norm 1.0
 )
@@ -111,7 +118,8 @@ miscellaneous_args=(
   --not_apply_cfg_solver
   --dit_precision "fp32"
   --num_euler_timesteps 50
-  --ema_start_step 0
+  --ema_start_step 100
+  --use_ema
 )
 
 export MASTER_PORT=29611
@@ -128,3 +136,4 @@ torchrun \
         "${optimizer_args[@]}" \
         "${validation_args[@]}" \
         "${miscellaneous_args[@]}"
+

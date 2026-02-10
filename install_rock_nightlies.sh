@@ -136,3 +136,9 @@ torch==${TORCH_VERSION}+rocm${ROCM_VERSION}${NIGHTLY_DATE}
 python -m pip install --no-cache --force-reinstall --no-deps \
 -i https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/ \
 torchvision==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}${NIGHTLY_DATE}   
+
+
+# For Triton installation, use 'pytorch-triton-rocm' for builds before 12/18
+python -m pip install \
+  -i https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/ \
+  pytorch-triton-rocm==3.3.1+rocm7.9.0rc20250930
