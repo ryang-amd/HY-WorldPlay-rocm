@@ -209,9 +209,10 @@ def sequence_parallel_attention(q, k, v,
         # prepare causal mask for chunk-wise attention
         latent_seq_length = 1560      # set for hunyuanvideo 1.5, which is for 480 * 832 resolution
         chunk_seq_length = 1560 * 4
-        chunk_num = (vision_seq_length) // chunk_seq_length
+        # Use ceiling division to handle partial chunks correctly
+        chunk_num = (vision_seq_length + chunk_seq_length - 1) // chunk_seq_length
         causal_mask = torch.zeros((total_seq_length, total_seq_length), device=query.device)
-        causal_mask[:, :text_seq_length] = 1  # no attention for the rest
+        causal_mask[:, :text_seq_length] = 1  # all tokens can attend to text
         for i in range(chunk_num):
             start_i = text_seq_length + i * chunk_seq_length
             end_i = min(start_i + chunk_seq_length, total_seq_length)
@@ -229,7 +230,10 @@ def sequence_parallel_attention(q, k, v,
         key = key.transpose(1, 2)      # B * H * L * D
         value = value.transpose(1, 2)  # B * H * L * D
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=causal_mask, dropout_p=0.0, is_causal=False)
+        # Use SDPA with the causal mask
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=causal_mask, dropout_p=0.0
+        )
         
         # transpose back
         hidden_states = hidden_states.transpose(1, 2)   # [B, S, H, D]

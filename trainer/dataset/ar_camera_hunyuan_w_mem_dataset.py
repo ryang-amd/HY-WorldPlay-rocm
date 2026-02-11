@@ -402,14 +402,18 @@ class CameraJsonWMemDataset(Dataset):
 
         self.points_local = generate_points_in_sphere(50000, 8.0).to(device)
 
+        neg_prompt_path = os.environ.get(
+            "HUNYUAN_NEG_PROMPT_PATH", "/your_path/to/hunyuan_neg_prompt.pt")
         self.neg_prompt_pt = torch.load(
-            "/your_path/to/hunyuan_neg_prompt.pt",
+            neg_prompt_path,
             map_location="cpu",
             weights_only=True,
         )
 
+        neg_byt5_path = os.environ.get(
+            "HUNYUAN_NEG_BYT5_PROMPT_PATH", "/your_path/to/hunyuan_neg_byt5_prompt.pt")
         self.neg_byt5_pt = torch.load(
-            "/your_path/to/hunyuan_neg_byt5_prompt.pt",
+            neg_byt5_path,
             map_location="cpu",
             weights_only=True,
         )
@@ -421,7 +425,8 @@ class CameraJsonWMemDataset(Dataset):
         c2w = np.linalg.inv(w2c)
         C0_inv = np.linalg.inv(c2w[0])
         c2w_aligned = np.array([C0_inv @ C for C in c2w])
-        return np.linalg.inv(c2w_aligned)
+        result = np.linalg.inv(c2w_aligned)
+        return result
 
     def one_hot_to_one_dimension(self, one_hot):
         y = torch.tensor([self.mapping[tuple(row.tolist())] for row in one_hot])
@@ -455,6 +460,7 @@ class CameraJsonWMemDataset(Dataset):
             self.shared_state["max_frames"] = 160
 
     def __getitem__(self, idx):
+        # Use actual index to train on full dataset
         while True:
             try:
                 json_data = self.json_data[idx]
@@ -497,8 +503,13 @@ class CameraJsonWMemDataset(Dataset):
                 pose_keys = list(pose_json.keys())
                 intrinsic_list = []
                 w2c_list = []
+                # Detect pose format: keys at latent-frame intervals (0,4,8,...) vs video-frame (0,1,2,...)
+                pose_per_latent = len(pose_keys) > 1 and (int(pose_keys[1]) - int(pose_keys[0])) > 1
                 for i in range(latent.shape[1]):
-                    t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
+                    if pose_per_latent:
+                        t_key = str(i * 4)
+                    else:
+                        t_key = pose_keys[0] if i == 0 else pose_keys[4 * (i - 1) + 4]
                     intrinsic = np.array(pose_json[t_key]['intrinsic'])
                     w2c = np.array(pose_json[t_key]['w2c'])
 
@@ -600,12 +611,16 @@ class CameraJsonWMemDataset(Dataset):
                 select_window_out_flag = 0  # whether to select the latents with length > window_frames
                 select_prob = self.rng.random()
 
-                if select_prob < 0.8:
-                    select_window_out_flag = 1  # mean to select frames outside the window
-                    max_index = latent.shape[1] - (self.window_frames - self.memory_frames)
+                # Check if video has enough frames for memory training
+                # Memory training requires: latent.shape[1] > window_frames + some margin
+                max_index = latent.shape[1] - (self.window_frames - self.memory_frames)
+                start_chunk_id = (self.window_frames) // 4
+                end_chunk_id = max_index // 4
+                can_do_memory_training = end_chunk_id > start_chunk_id
 
-                    start_chunk_id = (self.window_frames) // 4
-                    end_chunk_id = max_index // 4
+                if select_prob < 0.0 and can_do_memory_training:  # DISABLED: 80% memory training for long-term consistency (debugging NaN)
+                    select_window_out_flag = 1  # mean to select frames outside the window
+
                     current_frame_idx = self.rng.randint(start_chunk_id, end_chunk_id) * 4  # include the left and right
 
                     # -------------------- for ar, only search the memory for the current chunk
@@ -627,10 +642,17 @@ class CameraJsonWMemDataset(Dataset):
 
                 else:
                     pred_latent_size = self.window_frames
-                    latent = latent[:, :pred_latent_size, ...]
-                    w2c_list = w2c_list[:pred_latent_size]
-                    intrinsic_list = intrinsic_list[:pred_latent_size]
-                    action_for_pe = action_for_pe[:pred_latent_size]
+                    max_length = latent.shape[1]
+                    # Random start: sample from the full video so all frames get used (was bug: always used first 32)
+                    start_idx = self.rng.randint(0, max(0, max_length - pred_latent_size))
+                    end_idx = start_idx + pred_latent_size
+                    latent = latent[:, start_idx:end_idx, ...]
+                    w2c_list = w2c_list[start_idx:end_idx]
+                    intrinsic_list = intrinsic_list[start_idx:end_idx]
+                    action_for_pe = action_for_pe[start_idx:end_idx]
+                    # When sampling mid-video, use window's first frame as image conditioning
+                    if start_idx > 0:
+                        image_cond = latent[:, :1, :, :].clone()  # (C, 1, H, W) first frame of window
 
                 i2v_mask = torch.ones_like(latent)
 

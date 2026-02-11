@@ -132,6 +132,15 @@ def _prepare_apply_fns_all_dim(
     device = viewmats.device
     (batch, cameras, _, _) = viewmats.shape
 
+    # Normalize camera translations to prevent gradient explosion.
+    # The translation component (w2c[:, :3, 3]) can have large values (e.g., 50-100),
+    # which causes gradient explosion during backprop through 60+ transformer layers.
+    # We use a fixed scale factor to ensure consistent normalization across batches.
+    # This preserves relative motion while keeping values in a stable range.
+    TRANSLATION_SCALE = 100.0  # Fixed scale based on typical vKitti camera translation range
+    viewmats = viewmats.clone()
+    viewmats[..., :3, 3] = viewmats[..., :3, 3] / TRANSLATION_SCALE
+
     # Normalize camera intrinsics.
     if Ks is not None:
         Ks_norm = torch.zeros_like(Ks)
@@ -149,10 +158,12 @@ def _prepare_apply_fns_all_dim(
         # - P = lift(K) @ viewmats is an `image<-world` transform.
         P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_norm), viewmats)
         P_T = P.transpose(-1, -2).to(dtype=viewmats.dtype)
+        K_inv = _invert_K(Ks_norm)
+        SE3_inv = _invert_SE3(viewmats)
         P_inv = torch.einsum(
             "...ij,...jk->...ik",
-            _invert_SE3(viewmats),
-            _lift_K(_invert_K(Ks_norm)),
+            SE3_inv,
+            _lift_K(K_inv),
         ).to(dtype=viewmats.dtype)
 
     else:
