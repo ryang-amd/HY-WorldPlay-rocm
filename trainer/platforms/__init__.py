@@ -73,17 +73,29 @@ def cpu_platform_plugin() -> str | None:
 def rocm_platform_plugin() -> str | None:
     is_rocm = False
 
+    # Primary check: torch was built with ROCm (HIP)
     try:
-        import amdsmi
-        amdsmi.amdsmi_init()
-        try:
-            if len(amdsmi.amdsmi_get_processor_handles()) > 0:
+        import torch
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 is_rocm = True
-                logger.info("ROCm platform is available")
-        finally:
-            amdsmi.amdsmi_shut_down()
-    except Exception as e:
-        logger.info("ROCm platform is unavailable: %s", e)
+                logger.info("ROCm platform detected via torch.version.hip")
+    except Exception:
+        pass
+
+    # Fallback check: amdsmi
+    if not is_rocm:
+        try:
+            import amdsmi
+            amdsmi.amdsmi_init()
+            try:
+                if len(amdsmi.amdsmi_get_processor_handles()) > 0:
+                    is_rocm = True
+                    logger.info("ROCm platform detected via amdsmi")
+            finally:
+                amdsmi.amdsmi_shut_down()
+        except Exception as e:
+            logger.info("ROCm amdsmi check unavailable: %s", e)
 
     return "trainer.platforms.rocm.RocmPlatform" if is_rocm else None
 
@@ -100,18 +112,18 @@ def resolve_current_platform_cls_qualname() -> str:
     # TODO(will): if we need to support other platforms, we should consider if
     # vLLM's plugin architecture is suitable for our needs.
 
-    # Try MPS first on macOS
-    platform_cls_qualname = mps_platform_plugin()
-    if platform_cls_qualname is not None:
-        return platform_cls_qualname
-
-    # Fall back to ROCm
+    # Try ROCm first (check before MPS/CUDA since ROCm uses torch.cuda API)
     platform_cls_qualname = rocm_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
-    # Fall back to CUDA
+    # Try CUDA
     platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Try MPS on macOS
+    platform_cls_qualname = mps_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

@@ -948,9 +948,12 @@ def get_dp_rank() -> int:
 
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
-    return torch.device(f"cuda:{envs.LOCAL_RANK}"
-                        ) if current_platform.is_cuda_alike() else torch.device(
-                            "mps")
+    if current_platform.is_cuda_alike():
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+    elif current_platform.is_mps():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
 
 
 def maybe_init_distributed_environment_and_model_parallel(
