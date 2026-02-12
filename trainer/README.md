@@ -13,10 +13,14 @@ source setup_rock_env.sh
 
 Comment out torch related installations and install without dependencies
 ```
-pip install -r requirements.txt
-pip install --no-deps accelerate diffusers transformers peft
+pip install -r requirements_hunyuan.txt
+pip install torchdata --no-deps
 ```
 
+Install flash-attention
+```bash
+bash install_FA_Aiter_rocm.sh
+```
 
 
 ## Prepare the Dataset
