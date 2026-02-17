@@ -149,6 +149,18 @@ def _prepare_apply_fns_all_dim(
         Ks_norm[..., 0, 2] = 0
         Ks_norm[..., 1, 2] = 0
         Ks_norm[..., 2, 2] = 1.0
+
+        # Normalize focal lengths to ~1.0 to prevent bf16 gradient overflow.
+        # Raw focal lengths (e.g. ~725 for vKitti) amplify gradients through
+        # P^T @ Q in backward, which can exceed bf16 max (~65504).
+        # This is mathematically exact: scaling P uniformly cancels in ProPE
+        # because Q gets P^T and K gets P^{-1}, so s * s^{-1} = 1.
+        focal_scale = torch.maximum(
+            Ks_norm[..., 0, 0].abs(), Ks_norm[..., 1, 1].abs()
+        ).amax(dim=-1, keepdim=True).clamp(min=1.0)
+        Ks_norm[..., 0, 0] = Ks_norm[..., 0, 0] / focal_scale
+        Ks_norm[..., 1, 1] = Ks_norm[..., 1, 1] / focal_scale
+
         Ks_norm = Ks_norm.to(dtype=Ks.dtype)
         del Ks
 
@@ -156,15 +168,18 @@ def _prepare_apply_fns_all_dim(
         # - K is an `image<-camera` transform.
         # - viewmats is a `camera<-world` transform.
         # - P = lift(K) @ viewmats is an `image<-world` transform.
-        P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_norm), viewmats)
-        P_T = P.transpose(-1, -2).to(dtype=viewmats.dtype)
-        K_inv = _invert_K(Ks_norm)
-        SE3_inv = _invert_SE3(viewmats)
+        # Compute in fp32 for numerical stability in matrix inversions.
+        Ks_f32 = Ks_norm.float()
+        vm_f32 = viewmats.float()
+        P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_f32), vm_f32)
+        P_T = P.transpose(-1, -2)
+        K_inv = _invert_K(Ks_f32)
+        SE3_inv = _invert_SE3(vm_f32)
         P_inv = torch.einsum(
             "...ij,...jk->...ik",
             SE3_inv,
             _lift_K(K_inv),
-        ).to(dtype=viewmats.dtype)
+        )
 
     else:
         # GTA formula. P is `camera<-world` transform.
@@ -196,20 +211,27 @@ def _apply_tiled_projmat(
     feats: torch.Tensor,  # (batch, num_heads, seqlen, feat_dim)
     matrix: torch.Tensor,  # (batch, cameras, D, D)
 ) -> torch.Tensor:
-    """Apply projection matrix to features."""
+    """Apply projection matrix to features.
+
+    Computed in fp32 to prevent gradient overflow in bf16 backward pass.
+    The projection matrix values (even after focal-length normalization)
+    multiply gradients through many transformer layers.
+    """
     # - seqlen => (cameras, patches_x * patches_y)
     # - feat_dim => (feat_dim // 4, 4)
+    orig_dtype = feats.dtype
     (batch, num_heads, seqlen, feat_dim) = feats.shape
     cameras = matrix.shape[1]
     assert seqlen >= cameras and seqlen % cameras == 0
     D = matrix.shape[-1]
     assert matrix.shape == (batch, cameras, D, D)
     assert feat_dim % D == 0
-    return torch.einsum(
+    result = torch.einsum(
         "bcij,bncpkj->bncpki",
-        matrix,
-        feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
+        matrix.float(),
+        feats.float().reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
     ).reshape(feats.shape)
+    return result.to(orig_dtype)
 
 
 def _apply_block_diagonal(

@@ -135,6 +135,24 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 checkpointing_type=training_args.
                 enable_gradient_checkpointing_type)
 
+        # torch.compile: fuse small ops (norms, activations, element-wise)
+        # into fewer GPU kernels. Compile individual blocks (not the top-level
+        # model) to avoid dynamo issues with diffusers' ModelMixin.__getattr__.
+        # Attention functions are excluded via @torch.compiler.disable decorators.
+        if int(os.environ.get('TORCH_COMPILE', '0')):
+            compile_mode = os.environ.get('TORCH_COMPILE_MODE', 'max-autotune')
+            n_compiled = 0
+            for i, block in enumerate(self.transformer.double_blocks):
+                self.transformer.double_blocks[i] = torch.compile(
+                    block, mode=compile_mode, dynamic=True)
+                n_compiled += 1
+            for i, block in enumerate(self.transformer.single_blocks):
+                self.transformer.single_blocks[i] = torch.compile(
+                    block, mode=compile_mode, dynamic=True)
+                n_compiled += 1
+            logger.info("torch.compile applied to %d blocks (mode=%s)",
+                        n_compiled, compile_mode)
+
         self.set_trainable()
         params_to_optimize = self.transformer.parameters()
         params_to_optimize = list(
@@ -498,19 +516,41 @@ class TrainingPipeline(LoRAPipeline, ABC):
     def _clip_grad_norm(self, training_batch: TrainingBatch) -> TrainingBatch:
         max_grad_norm = self.training_args.max_grad_norm
 
-        # TODO(will): perhaps move this into transformer api so that we can do
-        # the following:
-        # grad_norm = transformer.clip_grad_norm_(max_grad_norm)
         if max_grad_norm is not None:
             model_parts = [self.transformer]
+            params = [p for m in model_parts for p in m.parameters()]
+
+            # Sanitize NaN/Inf gradients before clipping.
+            # Certain data samples (e.g. unusual camera poses) can produce NaN
+            # gradients through the ProPE backward pass. Zeroing them out lets
+            # the optimizer step proceed with the remaining valid gradients
+            # instead of skipping the entire step.
+            nan_count = 0
+            for p in params:
+                if p.grad is not None:
+                    bad = ~torch.isfinite(p.grad)
+                    if bad.any():
+                        nan_count += bad.sum().item()
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+            if nan_count > 0:
+                logger.warning(
+                    "Zeroed %d NaN/Inf gradient elements at step %s (video: %s)",
+                    nan_count, training_batch.current_timestep,
+                    getattr(training_batch, 'video_path', 'N/A'))
+
             grad_norm = clip_grad_norm_while_handling_failing_dtensor_cases(
-                [p for m in model_parts for p in m.parameters()],
+                params,
                 max_grad_norm,
                 foreach=None,
             )
-            assert grad_norm is not float('nan') or grad_norm is not float(
-                'inf')
             grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+            if math.isnan(grad_norm) or math.isinf(grad_norm):
+                logger.warning(
+                    "grad_norm is %s at step %s (video: %s). "
+                    "Skipping optimizer step.",
+                    grad_norm, training_batch.current_timestep,
+                    getattr(training_batch, 'video_path', 'N/A'))
         else:
             grad_norm = 0.0
         training_batch.grad_norm = grad_norm
@@ -534,10 +574,19 @@ class TrainingPipeline(LoRAPipeline, ABC):
         dist.all_reduce(grad_norm, op=dist.ReduceOp.MAX)
         training_batch.grad_norm = grad_norm.item()
 
-        if self.global_rank == 0 and training_batch.grad_norm >= 10.0:
-            print(self.global_rank, training_batch.grad_norm, training_batch.current_timestep, training_batch.video_path)
+        grad_is_valid = (
+            not math.isnan(training_batch.grad_norm)
+            and not math.isinf(training_batch.grad_norm)
+            and training_batch.grad_norm < 10.0
+        )
 
-        if training_batch.grad_norm < 10.0 or (not self.action): 
+        if self.global_rank == 0 and not grad_is_valid:
+            logger.warning(
+                "Skipping optimizer step: grad_norm=%.4f, timestep=%s, video=%s",
+                training_batch.grad_norm, training_batch.current_timestep,
+                getattr(training_batch, 'video_path', 'N/A'))
+
+        if grad_is_valid or (not self.action):
             self.optimizer.step()
             self.lr_scheduler.step()
 

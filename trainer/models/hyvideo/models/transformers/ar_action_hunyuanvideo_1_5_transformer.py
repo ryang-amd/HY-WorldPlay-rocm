@@ -232,6 +232,9 @@ class MMDoubleStreamBlock(nn.Module):
         img_attn_prope, _ = attn_prope[:, :img_q_prope.shape[1]].contiguous(), attn[:, img_q_prope.shape[1]:].contiguous()
         img_attn_prope = rearrange(img_attn_prope, "B L (H D) -> B H L D", H=self.heads_num)
         img_attn_prope = apply_fn_o(img_attn_prope) # [batch, num_heads, seqlen, head_dim]
+        # Guard against NaN from AITER attention backward / ProPE apply_fn_o.
+        # Without this, NaN poisons img_attn_prope_proj gradients (~17.6M elements).
+        img_attn_prope = torch.nan_to_num(img_attn_prope, nan=0.0, posinf=0.0, neginf=0.0)
         img_attn_prope = rearrange(img_attn_prope, "B H L D -> B L (H D)")
 
         img = img + apply_gate(self.img_attn_proj(img_attn) + self.img_attn_prope_proj(img_attn_prope), gate=img_mod1_gate)

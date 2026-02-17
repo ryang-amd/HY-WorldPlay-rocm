@@ -14,8 +14,18 @@
 # of rights and permissions under this agreement.
 # See the License for the specific language governing permissions and limitations under the License.
 
+import os
+
 import torch
 import torch.nn as nn
+
+# Try to import AITER's optimized RMSNorm (CK/ASM kernels for AMD GPUs)
+_AiterRMSNorm = None
+if int(os.environ.get('USE_AITER', '0')):
+    try:
+        from aiter import RMSNorm as _AiterRMSNorm
+    except (ImportError, AttributeError):
+        _AiterRMSNorm = None
 
 
 class RMSNorm(nn.Module):
@@ -92,6 +102,8 @@ def get_norm_layer(norm_layer):
     if norm_layer == "layer":
         return nn.LayerNorm
     elif norm_layer == "rms":
+        if _AiterRMSNorm is not None:
+            return _AiterRMSNorm
         return RMSNorm
     else:
         raise NotImplementedError(f"Norm layer {norm_layer} is not implemented")

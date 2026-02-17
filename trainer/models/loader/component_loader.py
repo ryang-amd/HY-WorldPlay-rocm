@@ -444,9 +444,11 @@ class TransformerLoader(ComponentLoader):
             cpu_offload=trainer_args.dit_cpu_offload,
             pin_cpu_memory=trainer_args.pin_cpu_memory,
             fsdp_inference=trainer_args.use_fsdp_inference,
-            # TODO(will): make these configurable
-            # param_dtype=torch.bfloat16,
-            param_dtype=torch.float32,
+            # Use bf16 for forward/backward compute (2x faster matmuls,
+            # halves all-gather bandwidth). Forward already uses bf16 via
+            # torch.autocast so this just avoids the redundant fp32->bf16 cast.
+            # Keep reduce_dtype in fp32 for numerically stable gradient reduction.
+            param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
             training_mode=trainer_args.training_mode)

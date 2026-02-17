@@ -14,6 +14,8 @@
 # of rights and permissions under this agreement.
 # See the License for the specific language governing permissions and limitations under the License.
 
+import os
+
 import einops
 import torch
 from typing import Optional
@@ -34,6 +36,23 @@ from trainer.distributed.parallel_state import (get_sp_parallel_rank,
                                                   get_sp_world_size)
 from trainer.distributed.communication_op import (
     sequence_model_parallel_all_gather, sequence_model_parallel_all_to_all_4D)
+
+# ---------------------------------------------------------------------------
+# AITER backend (AMD-optimized CK/ASM flash attention kernels)
+# ---------------------------------------------------------------------------
+USE_AITER = int(os.environ.get('USE_AITER', '0'))
+_aiter_module = None
+if USE_AITER:
+    try:
+        import aiter as _aiter_module  # noqa: F811
+        logger.info("AITER backend enabled for attention.")
+    except ImportError:
+        logger.warning("USE_AITER=1 but aiter is not installed. "
+                       "Falling back to cached-mask SDPA.")
+        _aiter_module = None
+
+# Cache for the chunk-wise causal mask (SDPA fallback path only)
+_causal_mask_cache: dict[tuple, torch.Tensor] = {}
 
 try:
     from torch.nn.attention.flex_attention import flex_attention
@@ -195,52 +214,95 @@ def sequence_parallel_attention(q, k, v,
         # transpose back
         hidden_states = hidden_states.transpose(1, 2)
 
-    # add new attn for chunk-wise attn
-    elif attn_mode == "torch_causal":    # now: we set text_mask = None
-        # attention: here we concat the encoder text sequence first, then apply causal attention
+    # Chunk-wise causal attention for AR model.
+    # Uses AITER flash attention when available; otherwise cached-mask SDPA.
+    elif attn_mode == "torch_causal":
         vision_seq_length = query.shape[1]
         text_seq_length = encoder_query.shape[1]
-        total_seq_length = vision_seq_length + text_seq_length
 
-        query = torch.cat([encoder_query, query], dim=1)
-        key = torch.cat([encoder_key, key], dim=1)
-        value = torch.cat([encoder_value, value], dim=1)
+        LATENT_SEQ_LENGTH = 1560   # per-frame spatial tokens for 480x832
+        CHUNK_SEQ_LENGTH = LATENT_SEQ_LENGTH * 4
+        chunk_num = (vision_seq_length + CHUNK_SEQ_LENGTH - 1) // CHUNK_SEQ_LENGTH
 
-        # prepare causal mask for chunk-wise attention
-        latent_seq_length = 1560      # set for hunyuanvideo 1.5, which is for 480 * 832 resolution
-        chunk_seq_length = 1560 * 4
-        # Use ceiling division to handle partial chunks correctly
-        chunk_num = (vision_seq_length + chunk_seq_length - 1) // chunk_seq_length
-        causal_mask = torch.zeros((total_seq_length, total_seq_length), device=query.device)
-        causal_mask[:, :text_seq_length] = 1  # all tokens can attend to text
-        for i in range(chunk_num):
-            start_i = text_seq_length + i * chunk_seq_length
-            end_i = min(start_i + chunk_seq_length, total_seq_length)
-            for j in range(i + 1):
-                start_j = text_seq_length + j * chunk_seq_length
-                end_j = min(start_j + chunk_seq_length, total_seq_length)
-                # full attention within chunk i for j == i, causal for j < i
-                causal_mask[start_i:end_i, start_j:end_j] = 1
+        if _aiter_module is not None:
+            # ---- AITER path: chunk-by-chunk flash attention, no mask ----
+            B = query.shape[0]
 
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # 1, 1, S, S
-        causal_mask = causal_mask.expand(query.shape[0], 1, -1, -1)
-        causal_mask = causal_mask.to(torch.bool)  # Force bool dtype
+            # Expand text encoder tokens to match vision batch size (text may be B=1)
+            enc_q = encoder_query.expand(B, -1, -1, -1)
+            enc_k = encoder_key.expand(B, -1, -1, -1)
+            enc_v = encoder_value.expand(B, -1, -1, -1)
 
-        query = query.transpose(1, 2)  # B * H * L * D
-        key = key.transpose(1, 2)      # B * H * L * D
-        value = value.transpose(1, 2)  # B * H * L * D
+            # 1. Text self-attention (text tokens attend to all text)
+            text_out, *_ = _aiter_module.flash_attn_func(
+                enc_q, enc_k, enc_v,
+                causal=False, return_lse=True,
+            )
 
-        # Use SDPA with the causal mask
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=causal_mask, dropout_p=0.0
-        )
-        
-        # transpose back
-        hidden_states = hidden_states.transpose(1, 2)   # [B, S, H, D]
+            # 2. Per-chunk vision attention
+            #    Each chunk attends to text + all vision chunks up to itself.
+            chunk_outputs = []
+            for i in range(chunk_num):
+                c_start = i * CHUNK_SEQ_LENGTH
+                c_end = min(c_start + CHUNK_SEQ_LENGTH, vision_seq_length)
+                kv_end = min((i + 1) * CHUNK_SEQ_LENGTH, vision_seq_length)
 
-        # return back to the original order: [query, encoder_query]
-        hidden_states, encoder_hidden_states = hidden_states[:, text_seq_length:, :, :], hidden_states[:, :text_seq_length, :, :]
-        hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+                chunk_q = query[:, c_start:c_end]
+                kv_k = torch.cat([enc_k, key[:, :kv_end]], dim=1)
+                kv_v = torch.cat([enc_v, value[:, :kv_end]], dim=1)
+
+                chunk_out, *_ = _aiter_module.flash_attn_func(
+                    chunk_q, kv_k, kv_v,
+                    causal=False, return_lse=True,
+                )
+                chunk_outputs.append(chunk_out)
+
+            # 3. Output in [vision, text] order
+            vision_out = torch.cat(chunk_outputs, dim=1)
+            hidden_states = torch.cat([vision_out, text_out], dim=1)
+
+        else:
+            # ---- Fallback: cached-mask SDPA (no AITER) ----
+            total_seq_length = vision_seq_length + text_seq_length
+
+            all_query = torch.cat([encoder_query, query], dim=1)
+            all_key = torch.cat([encoder_key, key], dim=1)
+            all_value = torch.cat([encoder_value, value], dim=1)
+
+            # Retrieve or create the cached mask
+            cache_key = (vision_seq_length, text_seq_length, all_query.device)
+            if cache_key not in _causal_mask_cache:
+                causal_mask = torch.zeros(
+                    (total_seq_length, total_seq_length),
+                    device=all_query.device)
+                causal_mask[:, :text_seq_length] = 1
+                for ci in range(chunk_num):
+                    s_i = text_seq_length + ci * CHUNK_SEQ_LENGTH
+                    e_i = min(s_i + CHUNK_SEQ_LENGTH, total_seq_length)
+                    for cj in range(ci + 1):
+                        s_j = text_seq_length + cj * CHUNK_SEQ_LENGTH
+                        e_j = min(s_j + CHUNK_SEQ_LENGTH, total_seq_length)
+                        causal_mask[s_i:e_i, s_j:e_j] = 1
+                _causal_mask_cache[cache_key] = (
+                    causal_mask.unsqueeze(0).unsqueeze(0).to(torch.bool))
+            cached_mask = _causal_mask_cache[cache_key]
+            causal_mask = cached_mask.expand(all_query.shape[0], 1, -1, -1)
+
+            all_query = all_query.transpose(1, 2)
+            all_key = all_key.transpose(1, 2)
+            all_value = all_value.transpose(1, 2)
+
+            hidden_states = F.scaled_dot_product_attention(
+                all_query, all_key, all_value,
+                attn_mask=causal_mask, dropout_p=0.0)
+
+            hidden_states = hidden_states.transpose(1, 2)
+
+            # Reorder from [text, vision] to [vision, text]
+            hidden_states = torch.cat([
+                hidden_states[:, text_seq_length:, :, :],
+                hidden_states[:, :text_seq_length, :, :],
+            ], dim=1)
         
     elif attn_mode == "flash2":
         query = torch.cat([query, encoder_query], dim=1)   # vision token first
@@ -343,8 +405,8 @@ def sequence_parallel_attention(q, k, v,
 
     if sp_world_size > 1:
         hidden_states, encoder_hidden_states = hidden_states.split_with_sizes((sequence_length, encoder_sequence_length), dim=1)
-        hidden_states = sequence_model_parallel_all_to_all_4D(hidden_states, scatter_dim=1, gather_dim=2)
-        encoder_hidden_states = sequence_model_parallel_all_gather(encoder_hidden_states, dim=2).contiguous()
+        hidden_states = sequence_model_parallel_all_to_all_4D(hidden_states.contiguous(), scatter_dim=1, gather_dim=2)
+        encoder_hidden_states = sequence_model_parallel_all_gather(encoder_hidden_states.contiguous(), dim=2).contiguous()
         hidden_states = hidden_states.to(query.dtype)
         encoder_hidden_states = encoder_hidden_states.to(query.dtype)
         hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
