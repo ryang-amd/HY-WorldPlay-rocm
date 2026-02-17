@@ -2042,6 +2042,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
             safetensor_path = action_ckpt
             state_dict = load_file(safetensor_path)
+            # Strip _orig_mod. prefix from keys saved by torch.compile-wrapped modules
+            if any("._orig_mod." in k for k in state_dict):
+                state_dict = {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+                print(f"Stripped _orig_mod. prefix from checkpoint keys (torch.compile artifact)")
             transformer.load_state_dict(state_dict, strict=True)
             print("HY-World 1.5 loading from: ", action_ckpt)
 
