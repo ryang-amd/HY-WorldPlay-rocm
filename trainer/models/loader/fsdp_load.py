@@ -113,7 +113,14 @@ def maybe_load_fsdp_model(
             if ar_action_load_from_dir is not None:
                 from safetensors.torch import load_file
                 state_dict = load_file(ar_action_load_from_dir)
-                model.load_state_dict(state_dict, strict=True)
+                # Strip _orig_mod. prefix from keys saved by torch.compile-wrapped modules
+                cleaned = {}
+                for k, v in state_dict.items():
+                    cleaned[k.replace("._orig_mod.", ".")] = v
+                if any("._orig_mod." in k for k in state_dict):
+                    logger.info("Stripped _orig_mod. prefix from %d checkpoint keys (torch.compile artifact)",
+                                sum(1 for k in state_dict if "._orig_mod." in k))
+                model.load_state_dict(cleaned, strict=True)
             logger.info(f"loading from: {ar_action_load_from_dir}")
             # model.add_channel_concat_parameters()
 

@@ -43,51 +43,76 @@ class ModulateDiT(nn.Module):
         return self.linear(self.act(x))
 
 
+def _expand_mod_vector(v, batch_size, seq_len):
+    """Expand a modulation vector (N, D) to (B, L, D).
+
+    The modulation vector has one value per latent frame (N = B * num_frames_per_sp).
+    Each frame's modulation is repeated for all spatial tokens in that frame.
+
+    For shared modulation vectors (N < batch_size, e.g. text timestep with N=1),
+    the single vector is broadcast across all batch items and sequence positions.
+
+    Args:
+        v: (N, D) modulation vector where N = batch_size * latent_frames_per_sp.
+        batch_size: Batch size B.
+        seq_len: Sequence length L per sample.
+
+    Returns:
+        (B, L, D) expanded modulation vector.
+    """
+    N = v.shape[0]
+    latent_length = N // batch_size  # frames per sample per SP rank
+
+    if latent_length == 0:
+        # Shared modulation (e.g. text timestep N=1): broadcast to all positions
+        return v[:1].unsqueeze(1).expand(batch_size, seq_len, -1)
+
+    token_length = seq_len // latent_length  # spatial tokens per frame
+    v = v.view(batch_size, latent_length, -1)  # (B, frames, D)
+    v = v.repeat_interleave(token_length, dim=1)  # (B, L, D)
+    return v
+
+
 def modulate(x, shift=None, scale=None):
     """modulate by shift and scale
 
+    Supports batch_size > 1. Modulation vectors have shape (N, D) where
+    N = batch_size * latent_frames_per_sp. Each frame's shift/scale is
+    applied to all spatial tokens in that frame.
+
     Args:
-        x (torch.Tensor): input tensor.
-        shift (torch.Tensor, optional): shift tensor. Defaults to None.
-        scale (torch.Tensor, optional): scale tensor. Defaults to None.
+        x (torch.Tensor): input tensor of shape (B, L, D).
+        shift (torch.Tensor, optional): shift tensor of shape (N, D). Defaults to None.
+        scale (torch.Tensor, optional): scale tensor of shape (N, D). Defaults to None.
 
     Returns:
         torch.Tensor: the output tensor after modulate.
     """
     if scale is None and shift is None:
         return x
-    elif shift is None:
-        scale = scale.unsqueeze(0)
-        latent_length = scale.shape[1] // x.shape[0]  # latent length
-        token_length = x.shape[1] // latent_length
-        # operate on the hidden_states
-        scale = scale.repeat_interleave(token_length, dim=1).type_as(x)
 
-        return x * (1 + scale)
-    elif scale is None:
-        shift = shift.unsqueeze(0)
-        latent_length = shift.shape[1] // x.shape[0]  # latent length
-        token_length = x.shape[1] // latent_length
-        # operate on the hidden_states
-        shift = shift.repeat_interleave(token_length, dim=1).type_as(x)
+    B = x.shape[0]
+    L = x.shape[1]
+
+    if shift is not None and scale is not None:
+        shift = _expand_mod_vector(shift, B, L).type_as(x)
+        scale = _expand_mod_vector(scale, B, L).type_as(x)
+        return x * (1 + scale) + shift
+    elif shift is not None:
+        shift = _expand_mod_vector(shift, B, L).type_as(x)
         return x + shift
     else:
-        shift = shift.unsqueeze(0)
-        scale = scale.unsqueeze(0)
-        latent_length = shift.shape[1] // x.shape[0]  # latent length
-        token_length = x.shape[1] // latent_length
-
-        scale = scale.repeat_interleave(token_length, dim=1).type_as(x)
-        shift = shift.repeat_interleave(token_length, dim=1).type_as(x)
-        return x * (1 + scale) + shift
+        scale = _expand_mod_vector(scale, B, L).type_as(x)
+        return x * (1 + scale)
 
 
 def apply_gate(x, gate=None, tanh=False):
-    """AI is creating summary for apply_gate
+    """Apply gating to input tensor.
 
     Args:
-        x (torch.Tensor): input tensor.
-        gate (torch.Tensor, optional): gate tensor. Defaults to None.
+        x (torch.Tensor): input tensor of shape (B, L, D).
+        gate (torch.Tensor, optional): gate tensor of shape (N, D) where
+            N = batch_size * latent_frames_per_sp. Defaults to None.
         tanh (bool, optional): whether to use tanh function. Defaults to False.
 
     Returns:
@@ -95,10 +120,9 @@ def apply_gate(x, gate=None, tanh=False):
     """
     if gate is None:
         return x
-    gate = gate.unsqueeze(0)
-    latent_length = gate.shape[1] // x.shape[0]  # latent length
-    token_length = x.shape[1] // latent_length
-    gate = gate.repeat_interleave(token_length, dim=1).type_as(x)
+    B = x.shape[0]
+    L = x.shape[1]
+    gate = _expand_mod_vector(gate, B, L).type_as(x)
     if tanh:
         return x * gate.tanh()
     else:
