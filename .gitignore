@@ -169,3 +169,5 @@ ckpts/
 
 hyvideo/utils/rewrite/i2v_env.sh
 wandb/
+eval_outputs/
+pretrained_models/
