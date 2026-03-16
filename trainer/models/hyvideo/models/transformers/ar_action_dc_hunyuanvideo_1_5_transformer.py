@@ -4,6 +4,7 @@
 # This module extends the AR Action HunyuanVideo transformer with dynamic chunking
 # capabilities for efficient video processing.
 
+from dataclasses import dataclass
 from typing import Any, List, Tuple, Optional, Union, Dict
 
 import torch
@@ -35,6 +36,17 @@ from trainer.distributed import sequence_model_parallel_all_gather
 from trainer.distributed.parallel_state import (get_sp_parallel_rank, get_sp_world_size)
 
 
+@dataclass
+class SegmentChunkState:
+    start_frame: int
+    end_frame: int
+    chunk_len: int
+    residual: torch.Tensor
+    bpred_output: RoutingModuleOutput
+    next_mask: torch.Tensor
+    selected_indices: torch.Tensor
+
+
 class DynamicChunkingModule(nn.Module):
     """Dynamic chunking module that wraps around transformer blocks.
     
@@ -46,6 +58,11 @@ class DynamicChunkingModule(nn.Module):
         self,
         hidden_size: int,
         config: DynamicChunkingConfig = None,
+        temporal_boundary_threshold: float = 0.5,
+        temporal_min_chunk_frames: int = 2,
+        temporal_max_chunk_frames: int = 8,
+        temporal_loss_weight: float = 0.01,
+        temporal_target_chunk_frames: int = 4,
         device=None,
         dtype=None,
     ):
@@ -90,6 +107,21 @@ class DynamicChunkingModule(nn.Module):
         nn.init.zeros_(self.residual_proj.weight)
         
         self.use_ste = config.use_ste
+        self.temporal_boundary_threshold = temporal_boundary_threshold
+        self.temporal_min_chunk_frames = temporal_min_chunk_frames
+        self.temporal_max_chunk_frames = temporal_max_chunk_frames
+        self.temporal_loss_weight = temporal_loss_weight
+        self.temporal_target_chunk_frames = max(1, temporal_target_chunk_frames)
+
+        self.temporal_boundary_head = nn.Sequential(
+            nn.LayerNorm(hidden_size, **factory_kwargs),
+            nn.Linear(hidden_size, 1, **factory_kwargs),
+        )
+        nn.init.zeros_(self.temporal_boundary_head[-1].weight)
+        nn.init.zeros_(self.temporal_boundary_head[-1].bias)
+
+        self.last_temporal_boundary_prob: Optional[torch.Tensor] = None
+        self.last_temporal_boundary_loss: Optional[torch.Tensor] = None
     
     def forward(
         self,
@@ -98,25 +130,53 @@ class DynamicChunkingModule(nn.Module):
         num_frames: Optional[int] = None,
         num_rows: Optional[int] = None,
         num_cols: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, RoutingModuleOutput]:
-        """Chunk the input tokens.
-        
-        Args:
-            hidden_states: (B, L, D) input tokens
-            mask: (B, L) valid token mask
-            num_frames: Number of video frames
-            num_rows: Spatial height
-            num_cols: Spatial width
-            
-        Returns:
-            chunked_states: (B, M, D) chunked hidden states
-            residual: (B, L, D) residual for skip connection
-            bpred_output: Routing output for dechunking
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, RoutingModuleOutput, torch.Tensor]:
+        """Chunk the input tokens (single-pass fallback path)."""
+        chunked_states, residual, bpred_output, next_mask, _ = self._chunk_once(
+            hidden_states=hidden_states,
+            mask=mask,
+            num_frames=num_frames,
+            num_rows=num_rows,
+            num_cols=num_cols,
+        )
+        return chunked_states, residual, bpred_output, next_mask
+
+    def _compute_selected_indices(
+        self,
+        boundary_mask: torch.Tensor,
+        boundary_prob: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct chunk selection indices used by ChunkLayer."""
+        num_tokens = boundary_mask.sum(dim=-1)
+        next_max_seqlen = int(num_tokens.max().item())
+        device = boundary_mask.device
+        length = boundary_mask.shape[1]
+        prob = boundary_prob[..., 1]
+
+        boundary_mask = boundary_mask.bool()
+        non_boundary_prob = prob.clone()
+        non_boundary_prob[boundary_mask] = float("-inf")
+        non_boundary_rank = torch.argsort(torch.argsort(-non_boundary_prob, dim=1), dim=1)
+        token_idx = torch.where(
+            boundary_mask,
+            torch.arange(length, device=device)[None, :],
+            length + non_boundary_rank,
+        )
+        seq_sorted_indices = torch.argsort(token_idx, dim=1)
+        return seq_sorted_indices[:, :next_max_seqlen]
+
+    def _chunk_once(
+        self,
+        hidden_states: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        num_frames: Optional[int],
+        num_rows: Optional[int],
+        num_cols: Optional[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, RoutingModuleOutput, torch.Tensor, torch.Tensor]:
         # Save for residual
         hidden_states_fp32 = hidden_states.to(dtype=self.residual_proj.weight.dtype)
         residual = self.residual_proj(hidden_states_fp32)
-        
+
         # Routing: determine boundary tokens
         bpred_output = self.routing_module(
             hidden_states,
@@ -125,7 +185,7 @@ class DynamicChunkingModule(nn.Module):
             num_rows=num_rows,
             num_cols=num_cols,
         )
-        
+
         # Chunk: compress to boundary tokens
         chunked_states, next_mask = self.chunk_layer(
             hidden_states,
@@ -133,8 +193,153 @@ class DynamicChunkingModule(nn.Module):
             bpred_output.boundary_prob,
             mask=mask
         )
-        
-        return chunked_states, residual, bpred_output, next_mask
+        selected_indices = self._compute_selected_indices(
+            boundary_mask=bpred_output.boundary_mask,
+            boundary_prob=bpred_output.boundary_prob,
+        )
+        return chunked_states, residual, bpred_output, next_mask, selected_indices
+
+    def _predict_temporal_segments(
+        self,
+        hidden_states: torch.Tensor,
+        num_frames: int,
+        num_rows: int,
+        num_cols: int,
+    ) -> List[Tuple[int, int]]:
+        tokens_per_frame = num_rows * num_cols
+        batch_size, _, dim = hidden_states.shape
+        frame_feats = hidden_states.reshape(batch_size, num_frames, tokens_per_frame, dim).mean(dim=2)
+        temporal_logits = self.temporal_boundary_head(frame_feats).squeeze(-1)
+        temporal_prob = torch.sigmoid(temporal_logits)
+        temporal_prob[:, 0] = 1.0
+        temporal_prob[:, -1] = 1.0
+        self.last_temporal_boundary_prob = temporal_prob
+
+        # Build shared boundaries across batch for stable sequence shape.
+        avg_prob = temporal_prob.mean(dim=0)
+        starts = [0]
+        for frame_idx in range(1, num_frames):
+            force_split = (frame_idx - starts[-1]) >= self.temporal_max_chunk_frames
+            select_split = (
+                avg_prob[frame_idx] >= self.temporal_boundary_threshold
+                and (frame_idx - starts[-1]) >= self.temporal_min_chunk_frames
+            )
+            if force_split or select_split:
+                starts.append(frame_idx)
+
+        if starts[-1] != num_frames:
+            starts.append(num_frames)
+
+        segments: List[Tuple[int, int]] = []
+        for idx in range(len(starts) - 1):
+            start = starts[idx]
+            end = starts[idx + 1]
+            if end > start:
+                segments.append((start, end))
+        if not segments:
+            segments = [(0, num_frames)]
+
+        # Temporal regularizer (chunk count + boundary smoothness).
+        target_chunks = max(1, int(round(num_frames / self.temporal_target_chunk_frames)))
+        expected_chunks = 1.0 + temporal_prob[:, 1:].sum(dim=1)
+        chunk_loss = (expected_chunks - target_chunks).pow(2).mean()
+        smooth_loss = (temporal_prob[:, 1:] - temporal_prob[:, :-1]).abs().mean()
+        self.last_temporal_boundary_loss = self.temporal_loss_weight * (chunk_loss + 0.1 * smooth_loss)
+        return segments
+
+    def chunk_with_temporal_segments(
+        self,
+        hidden_states: torch.Tensor,
+        num_frames: int,
+        num_rows: int,
+        num_cols: int,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[SegmentChunkState], RoutingModuleOutput]:
+        """Apply chunking per temporal segment and concat results."""
+        segments = self._predict_temporal_segments(hidden_states, num_frames, num_rows, num_cols)
+        tokens_per_frame = num_rows * num_cols
+
+        chunked_segments: List[torch.Tensor] = []
+        segment_states: List[SegmentChunkState] = []
+        all_boundary_prob: List[torch.Tensor] = []
+        all_boundary_mask: List[torch.Tensor] = []
+        all_selected_probs: List[torch.Tensor] = []
+
+        for start_frame, end_frame in segments:
+            start_token = start_frame * tokens_per_frame
+            end_token = end_frame * tokens_per_frame
+            segment_hidden = hidden_states[:, start_token:end_token, :]
+            segment_mask = None if mask is None else mask[:, start_token:end_token]
+
+            chunked_states, residual, bpred_output, next_mask, selected_indices = self._chunk_once(
+                hidden_states=segment_hidden,
+                mask=segment_mask,
+                num_frames=end_frame - start_frame,
+                num_rows=num_rows,
+                num_cols=num_cols,
+            )
+            chunked_segments.append(chunked_states)
+            all_boundary_prob.append(bpred_output.boundary_prob)
+            all_boundary_mask.append(bpred_output.boundary_mask)
+            all_selected_probs.append(bpred_output.selected_probs)
+
+            segment_states.append(
+                SegmentChunkState(
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    chunk_len=chunked_states.shape[1],
+                    residual=residual,
+                    bpred_output=bpred_output,
+                    next_mask=next_mask,
+                    selected_indices=selected_indices + start_token,
+                )
+            )
+
+        chunked_states = torch.cat(chunked_segments, dim=1)
+        merged_bpred_output = RoutingModuleOutput(
+            boundary_prob=torch.cat(all_boundary_prob, dim=1),
+            boundary_mask=torch.cat(all_boundary_mask, dim=1),
+            selected_probs=torch.cat(all_selected_probs, dim=1),
+        )
+        return chunked_states, segment_states, merged_bpred_output
+
+    def dechunk_with_temporal_segments(
+        self,
+        chunked_states: torch.Tensor,
+        segment_states: List[SegmentChunkState],
+        num_rows: int,
+        num_cols: int,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Dechunk per temporal segment and concat back to full sequence."""
+        restored_segments: List[torch.Tensor] = []
+        cursor = 0
+        for state in segment_states:
+            segment_chunked = chunked_states[:, cursor:cursor + state.chunk_len, :]
+            cursor += state.chunk_len
+            restored = self.dechunk(
+                chunked_states=segment_chunked,
+                residual=state.residual,
+                bpred_output=state.bpred_output,
+                mask=mask,
+                num_frames=state.end_frame - state.start_frame,
+                num_rows=num_rows,
+                num_cols=num_cols,
+            )
+            restored_segments.append(restored)
+        return torch.cat(restored_segments, dim=1)
+
+    def gather_rope_for_segments(
+        self,
+        freqs_cos: Optional[torch.Tensor],
+        freqs_sin: Optional[torch.Tensor],
+        segment_states: List[SegmentChunkState],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if freqs_cos is None or freqs_sin is None or len(segment_states) == 0:
+            return freqs_cos, freqs_sin
+        # Use the first sample's selected indices as shared token positions.
+        selected = torch.cat([state.selected_indices[0] for state in segment_states], dim=0).to(freqs_cos.device)
+        return freqs_cos.index_select(0, selected), freqs_sin.index_select(0, selected)
     
     def dechunk(
         self,
@@ -238,6 +443,11 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         dc_use_ste: bool = True,
         dc_encoder_conditional: bool = True,
         dc_ratio_loss_weight: float = 0.03,
+        dc_temporal_boundary_threshold: float = 0.5,
+        dc_temporal_min_chunk_frames: int = 2,
+        dc_temporal_max_chunk_frames: int = 8,
+        dc_temporal_target_chunk_frames: int = 4,
+        dc_temporal_loss_weight: float = 0.01,
         # Which blocks to apply chunking to (indices into single_blocks)
         dc_chunk_start_block: int = 0,
         dc_chunk_end_block: int = -1,  # -1 means last block
@@ -279,7 +489,9 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         
         # Dynamic chunking configuration
         self.dc_enabled = dc_enabled
+        self.dc_downsample_factor = dc_downsample_factor
         self.dc_ratio_loss_weight = dc_ratio_loss_weight
+        self.dc_temporal_loss_weight = dc_temporal_loss_weight
         self.dc_chunk_start_block = dc_chunk_start_block
         self.dc_chunk_end_block = dc_chunk_end_block if dc_chunk_end_block >= 0 else mm_single_blocks_depth
         
@@ -302,6 +514,11 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             self.dc_module = DynamicChunkingModule(
                 hidden_size=hidden_size,
                 config=dc_config,
+                temporal_boundary_threshold=dc_temporal_boundary_threshold,
+                temporal_min_chunk_frames=dc_temporal_min_chunk_frames,
+                temporal_max_chunk_frames=dc_temporal_max_chunk_frames,
+                temporal_loss_weight=dc_temporal_loss_weight,
+                temporal_target_chunk_frames=dc_temporal_target_chunk_frames,
             )
             
             # Store last routing output for loss computation
@@ -321,20 +538,30 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         Returns:
             ratio_loss: Scalar loss tensor
         """
+        model_device = next(self.parameters()).device
         if self.last_routing_output is None:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=model_device)
         
         # Compute actual ratio from boundary probabilities
         boundary_prob = self.last_routing_output.boundary_prob[..., 1]  # (B, L)
         actual_ratio = boundary_prob.mean()
         
         if target_ratio is None:
-            target_ratio = 1.0 / self.config.dc_downsample_factor
+            target_ratio = 1.0 / self.dc_downsample_factor
         
         # L2 loss between actual and target ratio
         ratio_loss = (actual_ratio - target_ratio) ** 2
         
         return ratio_loss * self.dc_ratio_loss_weight
+
+    def get_temporal_boundary_loss(self) -> torch.Tensor:
+        model_device = next(self.parameters()).device
+        if (not self.dc_enabled) or self.dc_module is None:
+            return torch.tensor(0.0, device=model_device)
+        loss = self.dc_module.last_temporal_boundary_loss
+        if loss is None:
+            return torch.tensor(0.0, device=model_device)
+        return loss
     
     def forward(
         self,
@@ -421,7 +648,8 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         if timestep_r is not None:
             vec = vec + self.time_r_in(timestep_r)
 
-        vec = vec + self.action_in(action)
+        if action is not None:
+            vec = vec + self.action_in(action)
 
         # Embed text tokens
         if self.text_projection == "linear":
@@ -519,24 +747,55 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         x = torch.cat((img, txt), 1)
         features_list = [] if output_features else None
         
+        self.last_routing_output = None
+        if self.dc_module is not None:
+            self.dc_module.last_temporal_boundary_loss = None
+            self.dc_module.last_temporal_boundary_prob = None
         # Dynamic chunking for single-stream blocks
         if self.dc_enabled and self.dc_module is not None and len(self.single_blocks) > 0:
             # Separate image and text tokens for chunking
             # Only chunk image tokens, keep text tokens as-is
             img_tokens = x[:, :img_seq_len, :]
             txt_tokens = x[:, img_seq_len:, :]
-            
-            # Chunk image tokens
-            chunked_img, residual, bpred_output, chunk_mask = self.dc_module(
-                img_tokens,
-                mask=None,
-                num_frames=tt,
-                num_rows=th,
-                num_cols=tw,
-            )
-            
+
+            if img_tokens.shape[1] == tt * th * tw:
+                chunked_img, segment_states, merged_bpred = self.dc_module.chunk_with_temporal_segments(
+                    hidden_states=img_tokens,
+                    mask=None,
+                    num_frames=tt,
+                    num_rows=th,
+                    num_cols=tw,
+                )
+            else:
+                # SP can shard image tokens in a way that breaks full (T,H,W) segmenting;
+                # fallback to one-shot chunking for compatibility.
+                chunked_img, residual, bpred_output, next_mask, selected_indices = self.dc_module._chunk_once(
+                    hidden_states=img_tokens,
+                    mask=None,
+                    num_frames=tt,
+                    num_rows=th,
+                    num_cols=tw,
+                )
+                segment_states = [
+                    SegmentChunkState(
+                        start_frame=0,
+                        end_frame=tt,
+                        chunk_len=chunked_img.shape[1],
+                        residual=residual,
+                        bpred_output=bpred_output,
+                        next_mask=next_mask,
+                        selected_indices=selected_indices,
+                    )
+                ]
+                merged_bpred = bpred_output
+
             # Store for ratio loss
-            self.last_routing_output = bpred_output
+            self.last_routing_output = merged_bpred
+            chunk_freqs_cos, chunk_freqs_sin = self.dc_module.gather_rope_for_segments(
+                freqs_cos=freqs_cos,
+                freqs_sin=freqs_sin,
+                segment_states=segment_states,
+            )
             
             # Process blocks with chunked tokens
             # For blocks in the chunking range, use chunked processing
@@ -563,7 +822,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                         vec_txt=vec_txt,
                         vec=vec,
                         txt_len=txt_seq_len,
-                        freqs_cis=None,  # Skip RoPE for chunked tokens (positions are mixed)
+                        freqs_cis=(chunk_freqs_cos, chunk_freqs_sin),
                         text_mask=text_mask,
                         attn_param=self.attn_param,
                         is_flash=force_full_attn,
@@ -576,12 +835,10 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                     # For blocks outside chunking range, dechunk first if needed
                     if index == self.dc_chunk_end_block:
                         # Dechunk before continuing with full resolution
-                        img_tokens = self.dc_module.dechunk(
-                            chunked_img,
-                            residual,
-                            bpred_output,
+                        img_tokens = self.dc_module.dechunk_with_temporal_segments(
+                            chunked_states=chunked_img,
+                            segment_states=segment_states,
                             mask=None,
-                            num_frames=tt,
                             num_rows=th,
                             num_cols=tw,
                         )
@@ -601,12 +858,10 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                 if output_features and index % output_features_stride == 0:
                     if index < self.dc_chunk_end_block:
                         # Need to dechunk for features
-                        feat_img = self.dc_module.dechunk(
-                            chunked_img,
-                            residual,
-                            bpred_output,
+                        feat_img = self.dc_module.dechunk_with_temporal_segments(
+                            chunked_states=chunked_img,
+                            segment_states=segment_states,
                             mask=None,
-                            num_frames=tt,
                             num_rows=th,
                             num_cols=tw,
                         )
@@ -616,12 +871,10 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             
             # Final dechunk if we haven't done it yet
             if self.dc_chunk_end_block >= len(self.single_blocks):
-                img_tokens = self.dc_module.dechunk(
-                    chunked_img,
-                    residual,
-                    bpred_output,
+                img_tokens = self.dc_module.dechunk_with_temporal_segments(
+                    chunked_states=chunked_img,
+                    segment_states=segment_states,
                     mask=None,
-                    num_frames=tt,
                     num_rows=th,
                     num_cols=tw,
                 )

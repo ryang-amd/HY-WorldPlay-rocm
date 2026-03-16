@@ -472,45 +472,38 @@ def compute_spatial_3d_nearest_boundary_idx(
     """
     B, L = boundary_mask.shape
     device = boundary_mask.device
-    tokens_per_frame = num_rows * num_cols
-    
-    # Create 3D coordinate grid (flattened to L)
-    # Order: T, H, W (frame-major, then row-major)
+
     frame_coords = torch.arange(num_frames, device=device).view(-1, 1, 1).expand(-1, num_rows, num_cols).flatten().float()
     row_coords = torch.arange(num_rows, device=device).view(1, -1, 1).expand(num_frames, -1, num_cols).flatten().float()
     col_coords = torch.arange(num_cols, device=device).view(1, 1, -1).expand(num_frames, num_rows, -1).flatten().float()
-    
-    # Get max number of boundaries across batch for padding
-    num_boundaries = boundary_mask.sum(dim=1)
-    M_max = num_boundaries.max().item()
-    
-    INF_DIST = float('inf')
-    
-    # Get boundary indices
-    sort_key = (~boundary_mask).long() * L + torch.arange(L, device=device).unsqueeze(0)
-    sorted_indices = torch.argsort(sort_key, dim=1)
-    boundary_indices = sorted_indices[:, :M_max]
-    
-    # Get 3D coordinates of boundary positions
-    boundary_frames = frame_coords[boundary_indices]
-    boundary_rows = row_coords[boundary_indices]
-    boundary_cols = col_coords[boundary_indices]
-    
-    # Create mask for valid boundaries
-    valid_boundary_mask = torch.arange(M_max, device=device).unsqueeze(0) < num_boundaries.unsqueeze(1)
-    
-    # Compute 3D squared Euclidean distance
-    frame_diff = frame_coords.view(1, L, 1) - boundary_frames.unsqueeze(1)
-    row_diff = row_coords.view(1, L, 1) - boundary_rows.unsqueeze(1)
-    col_diff = col_coords.view(1, L, 1) - boundary_cols.unsqueeze(1)
-    sq_dist = frame_diff**2 + row_diff**2 + col_diff**2
-    
-    # Mask out invalid boundaries
-    sq_dist = sq_dist.masked_fill(~valid_boundary_mask.unsqueeze(1), INF_DIST)
-    
-    # Find nearest boundary
-    plug_back_idx = torch.argmin(sq_dist, dim=2)
-    
+
+    plug_back_idx = torch.zeros((B, L), dtype=torch.long, device=device)
+    position_chunk = 2048
+    for batch_idx in range(B):
+        current_boundaries = torch.where(boundary_mask[batch_idx])[0]
+        if current_boundaries.numel() == 0:
+            current_boundaries = torch.tensor([0], dtype=torch.long, device=device)
+
+        b_frames = frame_coords[current_boundaries]
+        b_rows = row_coords[current_boundaries]
+        b_cols = col_coords[current_boundaries]
+
+        nearest_parts = []
+        for pos_start in range(0, L, position_chunk):
+            pos_end = min(pos_start + position_chunk, L)
+            q_frames = frame_coords[pos_start:pos_end].unsqueeze(1)
+            q_rows = row_coords[pos_start:pos_end].unsqueeze(1)
+            q_cols = col_coords[pos_start:pos_end].unsqueeze(1)
+            dist = (
+                (q_frames - b_frames.unsqueeze(0)) ** 2
+                + (q_rows - b_rows.unsqueeze(0)) ** 2
+                + (q_cols - b_cols.unsqueeze(0)) ** 2
+            )
+            nearest_parts.append(torch.argmin(dist, dim=1))
+
+        local_nearest = torch.cat(nearest_parts, dim=0)
+        plug_back_idx[batch_idx] = local_nearest
+
     return plug_back_idx
 
 

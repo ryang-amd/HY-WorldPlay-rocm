@@ -23,6 +23,7 @@ logger = init_logger(__name__)
 # huggingface class name: (component_name, trainer module name, trainer class name)
 _TEXT_TO_VIDEO_DIT_MODELS = {
     "HunyuanTransformer3DARActionModel": ("hyvideo", "models.transformers.ar_action_hunyuanvideo_1_5_transformer", "ARHunyuanVideo_1_5_DiffusionTransformer"),
+    "HunyuanTransformer3DARActionDCModel": ("hyvideo", "models.transformers.ar_action_dc_hunyuanvideo_1_5_transformer", "ARHunyuanVideo_1_5_DC_DiffusionTransformer"),
 }
 
 _IMAGE_TO_VIDEO_DIT_MODELS = {

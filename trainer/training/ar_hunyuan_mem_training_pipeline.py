@@ -505,6 +505,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
             diff = (model_pred.float() * i2v_mask - target.float() * i2v_mask) ** 2
             loss = diff.sum() / max(i2v_mask.sum(), 1) / self.training_args.gradient_accumulation_steps
 
+            # Optional dynamic-chunking regularizers.
+            if getattr(self.transformer, "dc_enabled", False):
+                if hasattr(self.transformer, "get_ratio_loss"):
+                    loss = loss + self.transformer.get_ratio_loss() / self.training_args.gradient_accumulation_steps
+                if hasattr(self.transformer, "get_temporal_boundary_loss"):
+                    loss = loss + self.transformer.get_temporal_boundary_loss() / self.training_args.gradient_accumulation_steps
+
             loss.backward()
             avg_loss = loss.detach().clone()
 
