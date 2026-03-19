@@ -587,10 +587,12 @@ class TrainingPipeline(LoRAPipeline, ABC):
         dist.all_reduce(grad_norm, op=dist.ReduceOp.MAX)
         training_batch.grad_norm = grad_norm.item()
 
+        dc_active = getattr(self.transformer, "dc_enabled", False)
+        grad_norm_limit = 100.0 if dc_active else 10.0
         grad_is_valid = (
             not math.isnan(training_batch.grad_norm)
             and not math.isinf(training_batch.grad_norm)
-            and training_batch.grad_norm < 10.0
+            and training_batch.grad_norm < grad_norm_limit
         )
 
         if self.global_rank == 0 and not grad_is_valid:
