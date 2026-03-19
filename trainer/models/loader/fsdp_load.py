@@ -113,16 +113,39 @@ def maybe_load_fsdp_model(
             if ar_action_load_from_dir is not None:
                 from safetensors.torch import load_file
                 state_dict = load_file(ar_action_load_from_dir)
-                # Strip _orig_mod. prefix from keys saved by torch.compile-wrapped modules
                 cleaned = {}
                 for k, v in state_dict.items():
                     cleaned[k.replace("._orig_mod.", ".")] = v
                 if any("._orig_mod." in k for k in state_dict):
                     logger.info("Stripped _orig_mod. prefix from %d checkpoint keys (torch.compile artifact)",
                                 sum(1 for k in state_dict if "._orig_mod." in k))
-                model.load_state_dict(cleaned, strict=True)
+                has_dc = getattr(model, "dc_enabled", False)
+                missing, unexpected = model.load_state_dict(cleaned, strict=not has_dc)
+                if has_dc and missing:
+                    logger.info("DC model: %d missing keys (newly initialized): %s",
+                                len(missing), missing[:10])
             logger.info(f"loading from: {ar_action_load_from_dir}")
-            # model.add_channel_concat_parameters()
+
+        for n, p in list(model.named_parameters()):
+            if p.is_meta:
+                materialized = torch.empty(p.shape, dtype=torch.float32, device="cpu")
+                torch.nn.init.normal_(materialized, std=0.02)
+                p_new = torch.nn.Parameter(materialized, requires_grad=p.requires_grad)
+                parts = n.split(".")
+                mod = model
+                for part in parts[:-1]:
+                    mod = getattr(mod, part)
+                setattr(mod, parts[-1], p_new)
+                logger.info("Materialized meta param %s -> cpu (%s)", n, list(p.shape))
+        for n, buf in list(model.named_buffers()):
+            if buf.is_meta:
+                materialized = torch.zeros(buf.shape, dtype=torch.float32, device="cpu")
+                parts = n.split(".")
+                mod = model
+                for part in parts[:-1]:
+                    mod = getattr(mod, part)
+                mod.register_buffer(parts[-1], materialized)
+                logger.info("Materialized meta buffer %s -> cpu (%s)", n, list(buf.shape))
 
         model.to(torch.float32)
 

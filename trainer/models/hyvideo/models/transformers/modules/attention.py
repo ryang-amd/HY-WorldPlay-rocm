@@ -188,31 +188,35 @@ def sequence_parallel_attention(q, k, v,
         query = torch.cat([query, encoder_query], dim=1)
         key = torch.cat([key, encoder_key], dim=1)
         value = torch.cat([value, encoder_value], dim=1)
-        if text_mask is not None:
-            attn_mask = F.pad(text_mask, (sequence_length, 0), value=True)
-        else:
-            attn_mask = None
 
-        if attn_mask is not None:
-            if attn_mask.dtype != torch.bool and attn_mask.dtype in [torch.int64, torch.int32]:
-                assert attn_mask.max() <= 1 and attn_mask.min() >= 0, f'Integer attention mask must be between 0 and 1 for torch attention.'
-                attn_mask = attn_mask.to(torch.bool)
-            elif attn_mask.dtype != torch.bool:
-                attn_mask = attn_mask.to(query.dtype)
-                raise NotImplementedError(f'Float attention mask is not implemented for torch attention.')
-            
-        # transpose q,k,v dim to fit scaled_dot_product_attention
-        query = query.transpose(1, 2)  # B * Head_num * length * dim
-        key = key.transpose(1, 2)      # B * Head_num * length * dim
-        value = value.transpose(1, 2)  # B * Head_num * length * dim
-        if attn_mask is not None:
-            attn_mask1 = einops.rearrange(attn_mask, 'b l -> b 1 l 1')
-            attn_mask2 = einops.rearrange(attn_mask1, 'b 1 l 1 -> b 1 1 l')
-            attn_mask = attn_mask1 & attn_mask2
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
-        
-        # transpose back
-        hidden_states = hidden_states.transpose(1, 2)
+        if _aiter_module is not None:
+            hidden_states, *_ = _aiter_module.flash_attn_func(
+                query, key, value,
+                causal=False, return_lse=True,
+            )
+        else:
+            if text_mask is not None:
+                attn_mask = F.pad(text_mask, (sequence_length, 0), value=True)
+            else:
+                attn_mask = None
+
+            if attn_mask is not None:
+                if attn_mask.dtype != torch.bool and attn_mask.dtype in [torch.int64, torch.int32]:
+                    assert attn_mask.max() <= 1 and attn_mask.min() >= 0, f'Integer attention mask must be between 0 and 1 for torch attention.'
+                    attn_mask = attn_mask.to(torch.bool)
+                elif attn_mask.dtype != torch.bool:
+                    attn_mask = attn_mask.to(query.dtype)
+                    raise NotImplementedError(f'Float attention mask is not implemented for torch attention.')
+
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            if attn_mask is not None:
+                attn_mask1 = einops.rearrange(attn_mask, 'b l -> b 1 l 1')
+                attn_mask2 = einops.rearrange(attn_mask1, 'b 1 l 1 -> b 1 1 l')
+                attn_mask = attn_mask1 & attn_mask2
+            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+            hidden_states = hidden_states.transpose(1, 2)
 
     # Chunk-wise causal attention for AR model.
     # Uses AITER flash attention when available; otherwise cached-mask SDPA.

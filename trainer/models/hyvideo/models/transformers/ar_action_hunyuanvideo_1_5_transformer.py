@@ -140,6 +140,8 @@ class MMDoubleStreamBlock(nn.Module):
         block_idx=None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
+        attn_mode_override: Optional[str] = None,
+        skip_prope: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_mod1_shift,
@@ -171,17 +173,17 @@ class MMDoubleStreamBlock(nn.Module):
         img_q = self.img_attn_q_norm(img_q).to(img_v)
         img_k = self.img_attn_k_norm(img_k).to(img_v)
 
-        # 添加连续的camera pose，通过prope
-        img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
-            img_q.permute(0, 2, 1, 3),
-            img_k.permute(0, 2, 1, 3),
-            img_v.permute(0, 2, 1, 3),
-            viewmats=viewmats,
-            Ks=Ks,
-        )  # [batch, num_heads, seqlen, head_dim]
-        img_q_prope = img_q_prope.permute(0, 2, 1, 3) # [batch, seqlen, num_heads, head_dim]
-        img_k_prope = img_k_prope.permute(0, 2, 1, 3) # [batch, seqlen, num_heads, head_dim]
-        img_v_prope = img_v_prope.permute(0, 2, 1, 3) # [batch, seqlen, num_heads, head_dim]
+        if not skip_prope:
+            img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
+                img_q.permute(0, 2, 1, 3),
+                img_k.permute(0, 2, 1, 3),
+                img_v.permute(0, 2, 1, 3),
+                viewmats=viewmats,
+                Ks=Ks,
+            )  # [batch, num_heads, seqlen, head_dim]
+            img_q_prope = img_q_prope.permute(0, 2, 1, 3)
+            img_k_prope = img_k_prope.permute(0, 2, 1, 3)
+            img_v_prope = img_v_prope.permute(0, 2, 1, 3)
 
         if freqs_cis is not None:
             img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
@@ -203,8 +205,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         txt_q_before = txt_q.clone()
 
-        # attn_mode = 'flash' if is_flash else self.attn_mode
-        attn_mode = 'torch_causal'     # for ar model, the default mode is flex_causal
+        attn_mode = attn_mode_override if attn_mode_override is not None else 'torch_causal'
         attn = parallel_attention(
             (img_q, txt_q),
             (img_k, txt_k),
@@ -218,26 +219,26 @@ class MMDoubleStreamBlock(nn.Module):
         )
         img_attn, txt_attn = attn[:, :img_q.shape[1]].contiguous(), attn[:, img_q.shape[1]:].contiguous()
 
-        attn_prope = parallel_attention(
-            (img_q_prope, txt_q),
-            (img_k_prope, txt_k),
-            (img_v_prope, txt_v),
-            img_q_len=img_q.shape[1],
-            img_kv_len=img_k.shape[1],
-            text_mask=text_mask,
-            attn_mode=attn_mode,
-            attn_param=attn_param,
-            block_idx=block_idx,
-        )
-        img_attn_prope, _ = attn_prope[:, :img_q_prope.shape[1]].contiguous(), attn[:, img_q_prope.shape[1]:].contiguous()
-        img_attn_prope = rearrange(img_attn_prope, "B L (H D) -> B H L D", H=self.heads_num)
-        img_attn_prope = apply_fn_o(img_attn_prope) # [batch, num_heads, seqlen, head_dim]
-        # Guard against NaN from AITER attention backward / ProPE apply_fn_o.
-        # Without this, NaN poisons img_attn_prope_proj gradients (~17.6M elements).
-        img_attn_prope = torch.nan_to_num(img_attn_prope, nan=0.0, posinf=0.0, neginf=0.0)
-        img_attn_prope = rearrange(img_attn_prope, "B H L D -> B L (H D)")
-
-        img = img + apply_gate(self.img_attn_proj(img_attn) + self.img_attn_prope_proj(img_attn_prope), gate=img_mod1_gate)
+        if not skip_prope:
+            attn_prope = parallel_attention(
+                (img_q_prope, txt_q),
+                (img_k_prope, txt_k),
+                (img_v_prope, txt_v),
+                img_q_len=img_q.shape[1],
+                img_kv_len=img_k.shape[1],
+                text_mask=text_mask,
+                attn_mode=attn_mode,
+                attn_param=attn_param,
+                block_idx=block_idx,
+            )
+            img_attn_prope, _ = attn_prope[:, :img_q_prope.shape[1]].contiguous(), attn[:, img_q_prope.shape[1]:].contiguous()
+            img_attn_prope = rearrange(img_attn_prope, "B L (H D) -> B H L D", H=self.heads_num)
+            img_attn_prope = apply_fn_o(img_attn_prope)
+            img_attn_prope = torch.nan_to_num(img_attn_prope, nan=0.0, posinf=0.0, neginf=0.0)
+            img_attn_prope = rearrange(img_attn_prope, "B H L D -> B L (H D)")
+            img = img + apply_gate(self.img_attn_proj(img_attn) + self.img_attn_prope_proj(img_attn_prope), gate=img_mod1_gate)
+        else:
+            img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
         img = img + apply_gate(
             self.img_mlp(
                 modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)
