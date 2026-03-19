@@ -310,7 +310,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         noise = torch.randn(latents.shape,
                             generator=self.noise_gen_cuda,
                             device=latents.device,
-                            dtype=latents.dtype)
+                            dtype=latents.dtype) #[1, 32, 32, 30, 52]
 
         # add a parameter: chunk_latent_num means number of latent in one chunk
         chunk_latent_num = 4
@@ -353,8 +353,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
             timesteps,
             n_dim=latents.ndim,
             dtype=latents.dtype,
-        )
-        sigmas = rearrange(sigmas, '(B D) C T H W -> B C (D T) H W', D=latent_t)
+        ) #[32, 1, 1, 1, 1]
+        sigmas = rearrange(sigmas, '(B D) C T H W -> B C (D T) H W', D=latent_t) #[1, 1, 32, 1, 1]
         noisy_model_input = (1.0 -
                              sigmas) * training_batch.latents + sigmas * noise
         training_batch.noisy_model_input = noisy_model_input
@@ -506,11 +506,17 @@ class TrainingPipeline(LoRAPipeline, ABC):
             loss = diff.sum() / max(i2v_mask.sum(), 1) / self.training_args.gradient_accumulation_steps
 
             # Optional dynamic-chunking regularizers.
+            training_batch.dc_ratio_loss_val = 0.0
+            training_batch.dc_temporal_loss_val = 0.0
             if getattr(self.transformer, "dc_enabled", False):
                 if hasattr(self.transformer, "get_ratio_loss"):
-                    loss = loss + self.transformer.get_ratio_loss() / self.training_args.gradient_accumulation_steps
+                    rl = self.transformer.get_ratio_loss()
+                    training_batch.dc_ratio_loss_val = rl.detach().item()
+                    loss = loss + rl / self.training_args.gradient_accumulation_steps
                 if hasattr(self.transformer, "get_temporal_boundary_loss"):
-                    loss = loss + self.transformer.get_temporal_boundary_loss() / self.training_args.gradient_accumulation_steps
+                    tl = self.transformer.get_temporal_boundary_loss()
+                    training_batch.dc_temporal_loss_val = tl.detach().item()
+                    loss = loss + tl / self.training_args.gradient_accumulation_steps
 
             loss.backward()
             avg_loss = loss.detach().clone()
@@ -692,17 +698,18 @@ class TrainingPipeline(LoRAPipeline, ABC):
             })
             progress_bar.update(1)
             if self.global_rank == 0:
-                wandb.log(
-                    {
-                        "train_loss": loss,
-                        "learning_rate": self.lr_scheduler.get_last_lr()[0],
-                        "step_time": step_time,
-                        "avg_step_time": avg_step_time,
-                        "grad_norm": grad_norm,
-                        "vsa_sparsity": current_vsa_sparsity,
-                    },
-                    step=step,
-                )
+                log_dict = {
+                    "train_loss": loss,
+                    "learning_rate": self.lr_scheduler.get_last_lr()[0],
+                    "step_time": step_time,
+                    "avg_step_time": avg_step_time,
+                    "grad_norm": grad_norm,
+                    "vsa_sparsity": current_vsa_sparsity,
+                }
+                if getattr(self.transformer, "dc_enabled", False):
+                    log_dict["dc/ratio_loss"] = getattr(training_batch, "dc_ratio_loss_val", 0.0)
+                    log_dict["dc/temporal_boundary_loss"] = getattr(training_batch, "dc_temporal_loss_val", 0.0)
+                wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:
                 save_checkpoint(self.transformer, self.global_rank,

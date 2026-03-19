@@ -222,7 +222,8 @@ class DynamicChunkingModule(nn.Module):
         # TODO: not simply mean over spatial tokens, but use a more sophisticated feature aggregation method
         frame_feats = hidden_states.reshape(batch_size, num_frames, tokens_per_frame, dim).mean(dim=2)
         temporal_logits = self.temporal_boundary_head(frame_feats).squeeze(-1)
-        temporal_prob = torch.sigmoid(temporal_logits)
+        temporal_prob_raw = torch.sigmoid(temporal_logits)
+        temporal_prob = temporal_prob_raw.clone()
         temporal_prob[:, 0] = 1.0
         temporal_prob[:, -1] = 1.0
         self.last_temporal_boundary_prob = temporal_prob
