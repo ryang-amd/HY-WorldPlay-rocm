@@ -95,17 +95,17 @@ class RoutingModule(nn.Module):
                 self.in_proj.weight.copy_(torch.eye(d_model))
             self.in_proj.weight._no_reinit = True
             
-            # 3x3x3 depthwise conv for spatial-temporal similarity
-            self.spatial_conv = nn.Conv3d(
+            # 3x3x3 depthwise conv for spatio-temporal similarity
+            self.spatio_temp_conv = nn.Conv3d(
                 d_model, d_model, kernel_size=3, padding=1,
                 groups=d_model, bias=False, **factory_kwargs
             )
             with torch.no_grad():
                 kernel = torch.ones(3, 3, 3) / 27.0
-                self.spatial_conv.weight.data.copy_(
+                self.spatio_temp_conv.weight.data.copy_(
                     kernel.view(1, 1, 3, 3, 3).expand(d_model, 1, 3, 3, 3)
                 )
-            self.spatial_conv.weight._no_reinit = True
+            self.spatio_temp_conv.weight._no_reinit = True
             
         elif routing_type == "temporal":
             # Temporal-only routing
@@ -147,11 +147,11 @@ class RoutingModule(nn.Module):
         return boundary_score
     
     def _compute_spatial_3d_boundary(self, hidden_states, num_frames, num_rows, num_cols):
-        """Compute boundary scores using 3D spatial-temporal convolution."""
+        """Compute boundary scores using 3D spatio-temporal convolution."""
         B, L, D = hidden_states.shape
         x = F.normalize(self.in_proj(hidden_states), dim=-1)
         x = x.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
-        diff = self.spatial_conv(x)  # (B, D, T, H, W)
+        diff = self.spatio_temp_conv(x)  # (B, D, T, H, W)
         boundary_score = diff.mean(dim=1)  # (B, T, H, W)
         boundary_score = boundary_score.view(B, L)  # (B, L)
         return boundary_score

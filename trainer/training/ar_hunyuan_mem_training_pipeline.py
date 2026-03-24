@@ -157,12 +157,15 @@ class TrainingPipeline(LoRAPipeline, ABC):
         params_to_optimize = self.transformer.parameters()
         params_to_optimize = list(
             filter(lambda p: p.requires_grad, params_to_optimize))
+        dc_active = getattr(self.transformer, "dc_enabled", False)
+        dc_mult = 10.0 if dc_active else 1.0
         self.optimizer = get_muon_optimizer(
             model=self.transformer,
-            lr=training_args.learning_rate,                      # Learning rate
-            weight_decay=training_args.weight_decay,  # Weight decay
-            adamw_betas=(0.9, 0.999),   # AdamW betas for 1D parameters
-            adamw_eps=1e-8,        # AdamW epsilon
+            lr=training_args.learning_rate,
+            weight_decay=training_args.weight_decay,
+            adamw_betas=(0.9, 0.999),
+            adamw_eps=1e-8,
+            dc_lr_multiplier=dc_mult,
         )
 
 
@@ -711,6 +714,16 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 if getattr(self.transformer, "dc_enabled", False):
                     log_dict["dc/ratio_loss"] = getattr(training_batch, "dc_ratio_loss_val", 0.0)
                     log_dict["dc/temporal_boundary_loss"] = getattr(training_batch, "dc_temporal_loss_val", 0.0)
+                    ro = getattr(self.transformer, "last_routing_output", None)
+                    if ro is not None:
+                        log_dict["dc/actual_boundary_ratio"] = ro.boundary_mask.float().mean().item()
+                        log_dict["dc/avg_boundary_prob"] = ro.boundary_prob[..., 1].float().mean().item()
+                    dc_mod = getattr(self.transformer, "dc_module", None)
+                    if dc_mod is not None:
+                        tp = getattr(dc_mod, "last_temporal_boundary_prob", None)
+                        if tp is not None:
+                            log_dict["dc/temporal_avg_prob"] = tp.float().mean().item()
+                    log_dict["dc/dc_lr"] = self.optimizer.param_groups[-1]["lr"] if len(self.optimizer.param_groups) > 1 else 0.0
                 wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:
