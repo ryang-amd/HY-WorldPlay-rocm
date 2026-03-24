@@ -63,10 +63,11 @@ export USE_AITER=1
 export AITER_TUNE_DIR="/tmp/aiter_${USER}"
 mkdir -p "$AITER_TUNE_DIR"
 
-# Enable torch.compile to fuse small ops (norms, activations, element-wise)
-# First step is slow (compilation), subsequent steps are faster
-export TORCH_COMPILE=1
-export TORCH_COMPILE_MODE="max-autotune"   # or reduce-overhead, max-autotune
+# torch.compile disabled for DC training: compiled blocks see different sequence
+# lengths in Phase 1 (full resolution) vs Phase 2 (chunked), causing shape errors
+# with max-autotune. Re-enable after DC shapes stabilize or use dynamic=True.
+export TORCH_COMPILE=0
+# export TORCH_COMPILE_MODE="max-autotune"
 # ============================================================
 # GPU configuration
 # ============================================================
@@ -111,6 +112,13 @@ parallel_args=(
 )
 
 # Model arguments
+# DC config lives in the repo so it's version-controlled and easy to modify.
+# It's copied to the pretrained model dir at launch so the model loader finds it.
+DC_CONFIG="${SCRIPT_DIR}/hunyuanvideo_dc_v1.json"
+DC_MODEL_DIR="${WORLDPLAY_PATH}/ar_model_dc_v1"
+mkdir -p "${DC_MODEL_DIR}"
+cp "${DC_CONFIG}" "${DC_MODEL_DIR}/config.json"
+
 # load_from_dir: AR model directory (has config.json with AR-specific architecture)
 # ar_action_load_from_dir: full model weights including action params
 # NOTE: Using ar_model (non-distilled, 50-step) instead of ar_distilled_action_model (4-step)
@@ -119,7 +127,7 @@ parallel_args=(
 #       trained with full diffusion steps.
 model_args=(
   --cls_name "HunyuanTransformer3DARActionDCModel"
-  --load_from_dir ${WORLDPLAY_PATH}/ar_model_dc_v1
+  --load_from_dir ${DC_MODEL_DIR}
   --ar_action_load_from_dir ${WORLDPLAY_PATH}/ar_model/diffusion_pytorch_model.safetensors
   --model_path $MODEL_PATH
   --pretrained_model_name_or_path $MODEL_PATH
@@ -172,7 +180,7 @@ export MASTER_PORT=29611
 python3 - <<PY
 import json, os
 from pathlib import Path
-cfg_path = Path(os.path.expandvars("${WORLDPLAY_PATH}/ar_model_dc_v1/config.json"))
+cfg_path = Path(os.path.expandvars("${DC_MODEL_DIR}/config.json"))
 cfg = json.loads(cfg_path.read_text())
 dc_enabled = bool(cfg.get("dc_enabled", False))
 double_depth = int(cfg.get("mm_double_blocks_depth", 0))
