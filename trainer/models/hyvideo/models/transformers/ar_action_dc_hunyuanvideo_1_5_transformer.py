@@ -543,6 +543,44 @@ class DynamicChunkingModule(nn.Module):
         selected = torch.cat(all_indices, dim=0).to(freqs_cos.device)
         return freqs_cos.index_select(0, selected), freqs_sin.index_select(0, selected)
 
+    def gather_vec_for_segments(
+        self,
+        vec: torch.Tensor,
+        segment_states: List[SegmentChunkState],
+        tokens_per_frame: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Build a per-chunked-token modulation vector from the per-frame vec.
+
+        vec has shape (B * N_frames, D) — one modulation vector per latent
+        frame, flattened across the batch.  selected_indices in each
+        SegmentChunkState has shape (B, M) mapping chunked tokens back to
+        their position in the full per-sample sequence.  Dividing by
+        tokens_per_frame gives the within-sample frame index; we then add
+        each sample's frame offset so we can index into the flattened vec.
+
+        Returns: (B * N_chunked, D) — matching the layout that
+        _expand_mod_vector expects.
+        """
+        num_frames = vec.shape[0] // batch_size
+
+        all_indices: List[torch.Tensor] = []
+        for state in segment_states:
+            if state.frame_states is not None:
+                for fstate in state.frame_states:
+                    all_indices.append(fstate.selected_indices)
+            else:
+                all_indices.append(state.selected_indices)
+        # (B, total_chunked)
+        selected = torch.cat(all_indices, dim=1).to(vec.device)
+        frame_indices = selected // tokens_per_frame  # (B, total_chunked)
+        frame_indices = frame_indices.clamp(max=num_frames - 1)
+
+        # Add per-sample offset so indices point into the flattened vec
+        offsets = torch.arange(batch_size, device=vec.device).unsqueeze(1) * num_frames
+        flat_indices = (frame_indices + offsets).reshape(-1)  # (B * total_chunked,)
+        return vec.index_select(0, flat_indices)
+
 
 class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTransformer):
     """HunyuanVideo Transformer with Dynamic Chunking (v1.1 -- double-stream).
@@ -685,32 +723,30 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             self.dc_module = None
             self.last_routing_output = None
     
-    def get_ratio_loss(self, target_ratio: Optional[float] = None) -> torch.Tensor:
-        """Compute the compression ratio loss.
-        
-        This loss encourages the model to achieve the target compression ratio.
-        
-        Args:
-            target_ratio: Target compression ratio (default: 1/downsample_factor)
-            
-        Returns:
-            ratio_loss: Scalar loss tensor
+    def get_ratio_loss(self) -> torch.Tensor:
+        """Load-balancing loss from DynamicChunkingDiT (hnet/utils/train.py).
+
+        Couples the hard boundary rate with the soft predicted probability,
+        producing much stronger gradients than a simple L2 penalty.
+        N = downsample_factor (target compression ratio, e.g. 4.0).
         """
         model_device = next(self.parameters()).device
         if self.last_routing_output is None:
             return torch.tensor(0.0, device=model_device)
-        
-        # Compute actual ratio from boundary probabilities
-        boundary_prob = self.last_routing_output.boundary_prob[..., 1]  # (B, L)
-        actual_ratio = boundary_prob.mean()
-        
-        if target_ratio is None:
-            target_ratio = 1.0 / self.dc_downsample_factor
-        
-        # L2 loss between actual and target ratio
-        ratio_loss = (actual_ratio - target_ratio) ** 2
-        
-        return ratio_loss * self.dc_ratio_loss_weight
+
+        N = self.dc_downsample_factor
+        boundary_prob = self.last_routing_output.boundary_prob
+        boundary_mask = self.last_routing_output.boundary_mask
+
+        avg_prob = boundary_prob[..., 1].float().mean()
+        true_ratio = boundary_mask.float().mean()
+
+        loss = (
+            (1.0 - true_ratio) * (1.0 - avg_prob)
+            + true_ratio * avg_prob * (N - 1)
+        ) * N / (N - 1)
+
+        return loss * self.dc_ratio_loss_weight
 
     def get_temporal_boundary_loss(self) -> torch.Tensor:
         model_device = next(self.parameters()).device
@@ -933,6 +969,14 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             chunk_freqs_cis = (chunk_freqs_cos, chunk_freqs_sin) if chunk_freqs_cos is not None else None
 
             # ---- Phase 2: DC-active double-stream blocks (chunked img, flash attn, no ProPE) ----
+            # vec has per-frame modulation (N_frames, D).  After chunking the
+            # tokens no longer sit on a regular frame grid, so we gather each
+            # chunked token's original frame vec to preserve per-frame conditioning.
+            tokens_per_frame = th * tw
+            vec_chunked = self.dc_module.gather_vec_for_segments(
+                vec, segment_states, tokens_per_frame, batch_size=bs,
+            )  # (B * N_chunked, D)
+
             for index in range(self.dc_chunk_start_block, self.dc_chunk_end_block):
                 if index >= num_double:
                     break
@@ -948,7 +992,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                 )
                 self.attn_param["layer-name"] = f"double_block_{index+1}"
                 chunked_img, txt = block(
-                    img=chunked_img, txt=txt, vec_txt=vec_txt, vec=vec,
+                    img=chunked_img, txt=txt, vec_txt=vec_txt, vec=vec_chunked,
                     freqs_cis=chunk_freqs_cis, text_mask=None,
                     attn_param=self.attn_param, is_flash=force_full_attn,
                     block_idx=index, viewmats=None, Ks=None,
