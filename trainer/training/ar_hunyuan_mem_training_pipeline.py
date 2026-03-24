@@ -139,10 +139,19 @@ class TrainingPipeline(LoRAPipeline, ABC):
         # into fewer GPU kernels. Compile individual blocks (not the top-level
         # model) to avoid dynamo issues with diffusers' ModelMixin.__getattr__.
         # Attention functions are excluded via @torch.compiler.disable decorators.
+        # When DC is active, Phase 2 blocks (dc_chunk_start..dc_chunk_end) see
+        # variable sequence lengths and are excluded from compilation.
         if int(os.environ.get('TORCH_COMPILE', '0')):
             compile_mode = os.environ.get('TORCH_COMPILE_MODE', 'max-autotune')
+            dc_start = getattr(self.transformer, "dc_chunk_start_block", -1)
+            dc_end = getattr(self.transformer, "dc_chunk_end_block", -1)
+            dc_active = getattr(self.transformer, "dc_enabled", False)
             n_compiled = 0
+            n_skipped = 0
             for i, block in enumerate(self.transformer.double_blocks):
+                if dc_active and dc_start <= i < dc_end:
+                    n_skipped += 1
+                    continue
                 self.transformer.double_blocks[i] = torch.compile(
                     block, mode=compile_mode, dynamic=True)
                 n_compiled += 1
@@ -150,15 +159,15 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 self.transformer.single_blocks[i] = torch.compile(
                     block, mode=compile_mode, dynamic=True)
                 n_compiled += 1
-            logger.info("torch.compile applied to %d blocks (mode=%s)",
-                        n_compiled, compile_mode)
+            logger.info("torch.compile applied to %d blocks (mode=%s), skipped %d DC blocks",
+                        n_compiled, compile_mode, n_skipped)
 
         self.set_trainable()
         params_to_optimize = self.transformer.parameters()
         params_to_optimize = list(
             filter(lambda p: p.requires_grad, params_to_optimize))
         dc_active = getattr(self.transformer, "dc_enabled", False)
-        dc_mult = 10.0 if dc_active else 1.0
+        dc_mult = 3.0 if dc_active else 1.0
         self.optimizer = get_muon_optimizer(
             model=self.transformer,
             lr=training_args.learning_rate,
@@ -168,6 +177,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
             dc_lr_multiplier=dc_mult,
         )
 
+        dc_prefix = "dc_module."
+        self._dc_params = [
+            p for n, p in self.transformer.named_parameters()
+            if p.requires_grad and (n.startswith(dc_prefix) or f".{dc_prefix}" in n)
+        ]
 
         self.init_steps = 0
         logger.info("optimizer: %s", self.optimizer)
@@ -522,6 +536,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     loss = loss + tl / self.training_args.gradient_accumulation_steps
 
             loss.backward()
+            torch.cuda.empty_cache()
             avg_loss = loss.detach().clone()
 
         dist.all_reduce(avg_loss, op=dist.ReduceOp.MAX)
@@ -536,11 +551,9 @@ class TrainingPipeline(LoRAPipeline, ABC):
             model_parts = [self.transformer]
             params = [p for m in model_parts for p in m.parameters()]
 
-            # Sanitize NaN/Inf gradients before clipping.
-            # Certain data samples (e.g. unusual camera poses) can produce NaN
-            # gradients through the ProPE backward pass. Zeroing them out lets
-            # the optimizer step proceed with the remaining valid gradients
-            # instead of skipping the entire step.
+            if self._dc_params:
+                torch.nn.utils.clip_grad_norm_(self._dc_params, max_norm=1.0)
+
             nan_count = 0
             for p in params:
                 if p.grad is not None:

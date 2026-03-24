@@ -63,11 +63,15 @@ export USE_AITER=1
 export AITER_TUNE_DIR="/tmp/aiter_${USER}"
 mkdir -p "$AITER_TUNE_DIR"
 
-# torch.compile disabled for DC training: compiled blocks see different sequence
-# lengths in Phase 1 (full resolution) vs Phase 2 (chunked), causing shape errors
-# with max-autotune. Re-enable after DC shapes stabilize or use dynamic=True.
-export TORCH_COMPILE=0
-# export TORCH_COMPILE_MODE="max-autotune"
+# torch.compile with reduce-overhead + dynamic=True for DC training.
+# max-autotune over-specializes on shapes and breaks when Phase 2 blocks see
+# chunked sequences.  reduce-overhead uses CUDA graphs with less shape rigidity
+# and dynamic=True (set in pipeline) tolerates variable sequence lengths.
+export TORCH_COMPILE=1
+export TORCH_COMPILE_MODE="default"
+
+# Note: expandable_segments is NOT supported on ROCm/HIP.
+# Memory fragmentation is handled via torch.cuda.empty_cache() after backward.
 # ============================================================
 # GPU configuration
 # ============================================================
