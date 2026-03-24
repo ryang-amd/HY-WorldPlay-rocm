@@ -80,6 +80,8 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.95, 0.95),
         adamw_eps=1e-8,
+        dc_adamw_params=None,
+        dc_lr_multiplier=1.0,
     ):
 
         defaults = dict(
@@ -96,13 +98,21 @@ class Muon(torch.optim.Optimizer):
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params.extend(adamw_params)
         super().__init__(params, defaults)
-        # Sort parameters into those for which we will use Muon, and those for which we will not
+
+        # DC params get their own group with a scaled learning rate.
+        dc_adamw_params = list(dc_adamw_params) if dc_adamw_params else []
+        if dc_adamw_params:
+            dc_group = dict(defaults)
+            dc_group["lr"] = lr * dc_lr_multiplier
+            dc_group["params"] = dc_adamw_params
+            self.param_groups.append(dc_group)
+            for p in dc_adamw_params:
+                self.state[p]["use_muon"] = False
+
         for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim >= 2, p.ndim
             self.state[p]["use_muon"] = True
         for p in adamw_params:
-            # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
 
     def adjust_lr_for_muon(self, lr, param_shape):
@@ -205,23 +215,27 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-# help function to create the Muon optimizer
 def get_muon_optimizer(model, 
                        lr=1e-3,  
                        weight_decay=0.1, 
                        momentum=0.95, 
                        adamw_betas=(0.95, 0.95), 
-                       adamw_eps=1e-8):
-    muon_params = [
-        p
-        for name, p in model.named_parameters()
-        if p.requires_grad and p.ndim >= 2 
-    ]
-    adamw_params = [
-        p
-        for name, p in model.named_parameters()
-        if p.requires_grad and not (p.ndim >= 2)
-    ]
+                       adamw_eps=1e-8,
+                       dc_lr_multiplier=1.0):
+    dc_prefix = "dc_module."
+    muon_params = []
+    adamw_params = []
+    dc_adamw_params = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith(dc_prefix) or f".{dc_prefix}" in name:
+            dc_adamw_params.append(p)
+        elif p.ndim >= 2:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
 
     return Muon(
         lr=lr,
@@ -231,4 +245,6 @@ def get_muon_optimizer(model,
         adamw_params=adamw_params,
         adamw_betas=adamw_betas,
         adamw_eps=adamw_eps,
+        dc_adamw_params=dc_adamw_params,
+        dc_lr_multiplier=dc_lr_multiplier,
     )
