@@ -896,8 +896,13 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         # print('text embedding shape:', txt.shape, text_mask.shape)
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        # mask the txt tokens based on the text_mask
-        txt = txt[text_mask.bool().to(txt.device)].unsqueeze(0)
+        # Keep only valid (non-padding) text tokens per sample.
+        # After reorder_txt_token, valid tokens are contiguous at the front
+        # of each sample.  Slice to the longest valid count so that the batch
+        # dimension is preserved (required for B > 1).
+        mask_bool = text_mask.bool().to(txt.device)
+        n_valid = mask_bool.sum(dim=-1).max().item()
+        txt = txt[:, :n_valid, :]
 
         # Pass through double-stream blocks
         for index, block in enumerate(self.double_blocks):

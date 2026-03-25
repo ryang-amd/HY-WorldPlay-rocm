@@ -86,7 +86,7 @@ training_args=(
   --action
   --i2v_rate 0.2
   --train_time_shift 3.0
-  --window_frames 32
+  --window_frames 32              # latent frames per training sample (NOT raw video frames)
   --wandb_key "${WANDB_API_KEY}"
   --wandb_entity "${WANDB_ENTITY}"
   --tracker_project_name "hy-worldplay-vkitti"
@@ -95,7 +95,7 @@ training_args=(
   --train_batch_size 1
   --train_sp_batch_size 1
   --gradient_accumulation_steps 1
-  --num_latent_t 9
+  --num_latent_t 9                # latent frames for validation sampling only (not used in training)
   --num_height 480
   --num_width 832
   --num_frames 77

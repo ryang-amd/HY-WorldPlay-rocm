@@ -900,8 +900,13 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        # Mask txt tokens based on text_mask
-        txt = txt[text_mask.bool().to(txt.device)].unsqueeze(0)
+        # Keep only valid (non-padding) text tokens per sample.
+        # After reorder_txt_token, valid tokens are contiguous at the front
+        # of each sample.  Slice to the longest valid count so that the batch
+        # dimension is preserved (required for B > 1).
+        mask_bool = text_mask.bool().to(txt.device)
+        n_valid = mask_bool.sum(dim=-1).max().item()
+        txt = txt[:, :n_valid, :]
 
         features_list = [] if output_features else None
         self.last_routing_output = None
