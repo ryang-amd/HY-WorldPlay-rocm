@@ -65,7 +65,7 @@ mkdir -p "${AITER_TUNE_DIR}"
 # Enable torch.compile to fuse small ops (norms, activations, element-wise)
 # First step is slow (compilation), subsequent steps are faster
 export TORCH_COMPILE=1
-export TORCH_COMPILE_MODE="max-autotune"   # or reduce-overhead, max-autotune
+export TORCH_COMPILE_MODE="default"   # match DC run for fair comparison
 # ============================================================
 # GPU configuration
 # ============================================================
@@ -84,7 +84,7 @@ training_args=(
   --wandb_key "${WANDB_API_KEY}"
   --wandb_entity "${WANDB_ENTITY}"
   --tracker_project_name "hy-worldplay-vkitti"
-  --output_dir /data/ruijyang/training_output/run4_full_run
+  --output_dir /data/ruijyang/training_output/baseline_benchmark
   --max_train_steps 500
   --train_batch_size 1
   --train_sp_batch_size 1
@@ -103,7 +103,7 @@ training_args=(
 # Parallel arguments
 parallel_args=(
   --num_gpus $((NUM_GPUS * 1))
-  --sp_size 2           # gpu number for each sp group, must divide window_frames evenly (32 % 2 == 0)
+  --sp_size 1           # match DC run for fair comparison (no sequence parallel)
   --tp_size 1
   --hsdp_replicate_dim 1
   --hsdp_shard_dim $NUM_GPUS
@@ -133,7 +133,7 @@ dataset_args=(
 validation_args=(
 #  --log_validation
   # --validation_dataset_file $VALIDATION_DATASET_FILE
-  --validation_steps 250
+  --validation_steps 999
   --validation_sampling_steps "50"s
   --validation_guidance_scale "6.0"
 )
