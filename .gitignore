@@ -165,6 +165,7 @@ logs/
 .cache/
 cache/
 ckpts/
+.aiter_cache/
 
 
 hyvideo/utils/rewrite/i2v_env.sh
