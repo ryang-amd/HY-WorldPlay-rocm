@@ -118,6 +118,9 @@ class DynamicChunkingConfig:
     kernel_sigma: float = 1.0
     conv_kernel_size: int = 5
     conv_sigma: float = 1.0
+    
+    # Causal smoothing: mask future boundaries in spatial_kernel dechunk
+    causal_smooth: bool = False
 
 
 @dataclass 

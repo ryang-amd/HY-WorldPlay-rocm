@@ -41,7 +41,7 @@ from trainer.models.hyvideo.models.text_encoders.byT5 import ByT5Mapper
 
 from trainer.distributed.parallel_state import (get_sp_parallel_rank,
                                                   get_sp_world_size)
-from trainer.models.prope.camera_rope import prope_qkv
+from trainer.models.prope.camera_rope import prope_qkv, prope_qkv_chunked
 from trainer.configs.models.dits import HunyuanVideoConfig
 from trainer.distributed import (get_world_group)
 
@@ -174,13 +174,26 @@ class MMDoubleStreamBlock(nn.Module):
         img_k = self.img_attn_k_norm(img_k).to(img_v)
 
         if not skip_prope:
-            img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
-                img_q.permute(0, 2, 1, 3),
-                img_k.permute(0, 2, 1, 3),
-                img_v.permute(0, 2, 1, 3),
-                viewmats=viewmats,
-                Ks=Ks,
-            )  # [batch, num_heads, seqlen, head_dim]
+            use_chunked_prope = (
+                viewmats is not None
+                and viewmats.shape[1] == img_q.shape[1]
+            )
+            if use_chunked_prope:
+                img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv_chunked(
+                    img_q.permute(0, 2, 1, 3),
+                    img_k.permute(0, 2, 1, 3),
+                    img_v.permute(0, 2, 1, 3),
+                    viewmats=viewmats,
+                    Ks=Ks,
+                )
+            else:
+                img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
+                    img_q.permute(0, 2, 1, 3),
+                    img_k.permute(0, 2, 1, 3),
+                    img_v.permute(0, 2, 1, 3),
+                    viewmats=viewmats,
+                    Ks=Ks,
+                )
             img_q_prope = img_q_prope.permute(0, 2, 1, 3)
             img_k_prope = img_k_prope.permute(0, 2, 1, 3)
             img_v_prope = img_v_prope.permute(0, 2, 1, 3)
@@ -773,6 +786,7 @@ class ARHunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         action: Optional[torch.Tensor] = None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
 
         if guidance is None:

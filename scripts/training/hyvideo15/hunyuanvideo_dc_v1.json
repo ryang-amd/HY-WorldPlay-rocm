@@ -33,11 +33,12 @@
 
     "dc_enabled": true,
     "dc_downsample_factor": 4.0,
-    "dc_routing_type": "spatial_3d",
+    "dc_routing_type": "spatial_3d_causal",
     "dc_encoder_direction": "bidirectional_2d",
     "dc_dechunk_scan_mode": "bidirectional_2d",
     "dc_plug_back_mode": "nearest_3d",
     "dc_smooth_mode": "spatial_kernel",
+    "dc_causal_smooth": false,
     "dc_use_ste": true,
     "dc_encoder_conditional": true,
     "dc_ratio_loss_weight": 0.03,

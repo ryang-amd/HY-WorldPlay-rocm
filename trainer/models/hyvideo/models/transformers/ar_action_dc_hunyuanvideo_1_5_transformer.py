@@ -36,6 +36,19 @@ from trainer.distributed import sequence_model_parallel_all_gather
 from trainer.distributed.parallel_state import (get_sp_parallel_rank, get_sp_world_size)
 
 
+def _get_sp_parallel_state_safe() -> Tuple[int, int]:
+    """Return sequence-parallel world size/rank, defaulting to non-SP inference.
+
+    In training, SP groups are initialized and these calls succeed.
+    In standalone inference with the training transformer class, SP groups may
+    be absent; in that case fall back to world_size=1, rank=0.
+    """
+    try:
+        return get_sp_world_size(), get_sp_parallel_rank()
+    except AssertionError:
+        return 1, 0
+
+
 @dataclass
 class FrameChunkState:
     frame_idx: int
@@ -109,6 +122,7 @@ class DynamicChunkingModule(nn.Module):
             kernel_sigma=config.kernel_sigma,
             conv_kernel_size=config.conv_kernel_size,
             conv_sigma=config.conv_sigma,
+            causal_smooth=config.causal_smooth,
         )
         
         # Residual projection (in fp32 for numerical stability)
@@ -581,6 +595,45 @@ class DynamicChunkingModule(nn.Module):
         flat_indices = (frame_indices + offsets).reshape(-1)  # (B * total_chunked,)
         return vec.index_select(0, flat_indices)
 
+    def gather_viewmats_for_segments(
+        self,
+        viewmats: Optional[torch.Tensor],
+        Ks: Optional[torch.Tensor],
+        segment_states: List[SegmentChunkState],
+        tokens_per_frame: int,
+        batch_size: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Gather per-frame camera matrices to per-chunked-token layout.
+
+        viewmats/Ks have shape (B, N_frames, ...) (not flattened like vec).
+        Frame index per chunked token is selected_indices // tokens_per_frame,
+        same as gather_vec_for_segments. Handles per-frame chunking
+        (frame_states) and whole-segment chunking alike.
+
+        Returns:
+            viewmats_chunked (B, N_chunked, 4, 4), Ks_chunked (B, N_chunked, 3, 3).
+        """
+        if viewmats is None or Ks is None or len(segment_states) == 0:
+            return viewmats, Ks
+
+        num_frames = viewmats.shape[1]
+        all_indices: List[torch.Tensor] = []
+        for state in segment_states:
+            if state.frame_states is not None:
+                for fstate in state.frame_states:
+                    all_indices.append(fstate.selected_indices)
+            else:
+                all_indices.append(state.selected_indices)
+        selected = torch.cat(all_indices, dim=1).to(viewmats.device)
+        frame_indices = (selected // tokens_per_frame).clamp(max=num_frames - 1)
+
+        b_idx = torch.arange(
+            batch_size, device=viewmats.device, dtype=frame_indices.dtype
+        ).unsqueeze(1).expand_as(frame_indices)
+        viewmats_chunked = viewmats[b_idx, frame_indices]
+        Ks_chunked = Ks[b_idx, frame_indices]
+        return viewmats_chunked, Ks_chunked
+
 
 class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTransformer):
     """HunyuanVideo Transformer with Dynamic Chunking (v1.1 -- double-stream).
@@ -644,6 +697,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         dc_temporal_max_chunk_frames: int = 8,
         dc_temporal_target_chunk_frames: int = 4,
         dc_temporal_loss_weight: float = 0.01,
+        dc_causal_smooth: bool = False,
         # Which double-stream blocks to apply DC to (indices into double_blocks)
         dc_chunk_start_block: int = 10,
         dc_chunk_end_block: int = -1,  # -1 means use mm_double_blocks_depth
@@ -704,6 +758,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                 dechunk_smooth_mode=[dc_smooth_mode, None],
                 use_ste=dc_use_ste,
                 ratio_loss_weight=dc_ratio_loss_weight,
+                causal_smooth=dc_causal_smooth,
             )
             
             # Dynamic chunking module
@@ -779,6 +834,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         action: Optional[torch.Tensor] = None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Forward pass with optional dynamic chunking on double-stream blocks."""
         if guidance is None:
@@ -803,8 +859,7 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
 
         img = self.img_in(img)
 
-        sp_world_size = get_sp_world_size()
-        rank_in_sp_group = get_sp_parallel_rank()
+        sp_world_size, rank_in_sp_group = _get_sp_parallel_state_safe()
         if sp_world_size > 1:
             sp_size = sp_world_size
             sp_rank = rank_in_sp_group
@@ -981,6 +1036,9 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             vec_chunked = self.dc_module.gather_vec_for_segments(
                 vec, segment_states, tokens_per_frame, batch_size=bs,
             )  # (B * N_chunked, D)
+            viewmats_chunked, Ks_chunked = self.dc_module.gather_viewmats_for_segments(
+                viewmats, Ks, segment_states, tokens_per_frame, batch_size=bs,
+            )
 
             for index in range(self.dc_chunk_start_block, self.dc_chunk_end_block):
                 if index >= num_double:
@@ -1000,8 +1058,8 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
                     img=chunked_img, txt=txt, vec_txt=vec_txt, vec=vec_chunked,
                     freqs_cis=chunk_freqs_cis, text_mask=None,
                     attn_param=self.attn_param, is_flash=force_full_attn,
-                    block_idx=index, viewmats=None, Ks=None,
-                    attn_mode_override="torch", skip_prope=True,
+                    block_idx=index, viewmats=viewmats_chunked, Ks=Ks_chunked,
+                    attn_mode_override="torch", skip_prope=False,
                 )
 
             # ---- Dechunk img tokens before Phase 3 ----

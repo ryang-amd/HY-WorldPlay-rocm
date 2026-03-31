@@ -37,6 +37,15 @@ from trainer.distributed.parallel_state import (get_sp_parallel_rank,
 from trainer.distributed.communication_op import (
     sequence_model_parallel_all_gather, sequence_model_parallel_all_to_all_4D)
 
+
+def _get_sp_parallel_state_safe():
+    """Return sequence-parallel (world_size, rank), defaulting to non-SP."""
+    try:
+        return get_sp_world_size(), get_sp_parallel_rank()
+    except AssertionError:
+        return 1, 0
+
+
 # ---------------------------------------------------------------------------
 # AITER backend (AMD-optimized CK/ASM flash attention kernels)
 # ---------------------------------------------------------------------------
@@ -151,8 +160,7 @@ def sequence_parallel_attention(q, k, v,
     key, encoder_key = k
     value, encoder_value = v
 
-    sp_world_size = get_sp_world_size()
-    rank_in_sp_group = get_sp_parallel_rank()
+    sp_world_size, rank_in_sp_group = _get_sp_parallel_state_safe()
 
     if sp_world_size > 1:
         sp_size = sp_world_size

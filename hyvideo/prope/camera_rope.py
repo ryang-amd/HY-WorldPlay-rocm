@@ -113,6 +113,95 @@ def prope_qkv(
     return query, key, value, apply_fn_o
 
 
+def _compute_per_token_matrices(
+    viewmats: torch.Tensor,
+    Ks: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute P, P_T, P_inv for per-token camera matrices.
+
+    Returns P_T, P_inv, P each with shape (batch, seqlen, 4, 4).
+    """
+    TRANSLATION_SCALE = 100.0
+    viewmats = viewmats.clone()
+    viewmats[..., :3, 3] = viewmats[..., :3, 3] / TRANSLATION_SCALE
+
+    if Ks is not None:
+        Ks_norm = torch.zeros_like(Ks)
+        Ks_norm[..., 0, 0] = Ks[..., 0, 0]
+        Ks_norm[..., 1, 1] = Ks[..., 1, 1]
+        Ks_norm[..., 0, 2] = 0
+        Ks_norm[..., 1, 2] = 0
+        Ks_norm[..., 2, 2] = 1.0
+
+        focal_scale = torch.maximum(
+            Ks_norm[..., 0, 0].abs(), Ks_norm[..., 1, 1].abs()
+        ).amax(dim=-1, keepdim=True).clamp(min=1.0)
+        Ks_norm[..., 0, 0] = Ks_norm[..., 0, 0] / focal_scale
+        Ks_norm[..., 1, 1] = Ks_norm[..., 1, 1] / focal_scale
+        Ks_norm = Ks_norm.to(dtype=Ks.dtype)
+
+        Ks_f32 = Ks_norm.float()
+        vm_f32 = viewmats.float()
+        P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_f32), vm_f32)
+        K_inv = _invert_K(Ks_f32)
+        SE3_inv = _invert_SE3(vm_f32)
+        P_inv = torch.einsum("...ij,...jk->...ik", SE3_inv, _lift_K(K_inv))
+    else:
+        P = viewmats.float()
+        P_inv = _invert_SE3(P)
+
+    P_T = P.transpose(-1, -2)
+    return P_T, P_inv, P
+
+
+def _apply_per_token_projmat(
+    feats: torch.Tensor,
+    matrix: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a unique per-token projection matrix to features.
+
+    head_dim is split into groups of D (=4) and each group is transformed.
+    """
+    orig_dtype = feats.dtype
+    (batch, num_heads, seqlen, head_dim) = feats.shape
+    D = matrix.shape[-1]
+    assert matrix.shape == (batch, seqlen, D, D)
+    assert head_dim % D == 0
+    feats_grouped = feats.float().reshape(batch, num_heads, seqlen, head_dim // D, D)
+    mat = matrix.float().unsqueeze(1)
+    result = torch.einsum("bmlij,bnlkj->bnlki", mat, feats_grouped)
+    return result.reshape(feats.shape).to(orig_dtype)
+
+
+def prope_qkv_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    viewmats: torch.Tensor,
+    Ks: Optional[torch.Tensor],
+    **kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable]:
+    """ProPE for irregular/chunked token sequences.
+
+    Accepts per-token camera matrices (batch, seqlen, 4, 4) instead of
+    requiring seqlen = cameras * patches (regular grid).
+    """
+    (batch, num_heads, seqlen, head_dim) = q.shape
+    assert viewmats.shape == (batch, seqlen, 4, 4)
+    assert Ks is None or Ks.shape == (batch, seqlen, 3, 3)
+    assert head_dim % 4 == 0
+
+    P_T, P_inv, P = _compute_per_token_matrices(viewmats, Ks)
+
+    query = _apply_per_token_projmat(q, P_T)
+    key = _apply_per_token_projmat(k, P_inv)
+    value = _apply_per_token_projmat(v, P_inv)
+
+    apply_fn_o = partial(_apply_per_token_projmat, matrix=P)
+    return query, key, value, apply_fn_o
+
+
 def _prepare_apply_fns_all_dim(
     head_dim: int,  # Q/K/V will have this last dimension
     viewmats: torch.Tensor,  # (batch, cameras, 4, 4)

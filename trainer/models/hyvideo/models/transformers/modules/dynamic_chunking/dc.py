@@ -49,6 +49,7 @@ class RoutingModule(nn.Module):
     
     For video data with temporal dimension, supports:
     - 'spatial_3d': 3D convolution considering T, H, W
+    - 'spatial_3d_causal': Same layers as spatial_3d; causal temporal padding in forward
     - 'temporal': Only temporal dimension routing
     """
 
@@ -88,8 +89,8 @@ class RoutingModule(nn.Module):
                 )
             self.spatial_conv.weight._no_reinit = True
             
-        elif routing_type == "spatial_3d":
-            # 3D spatial-temporal routing (for video)
+        elif routing_type in ("spatial_3d", "spatial_3d_causal"):
+            # 3D spatial-temporal routing (for video); causal variant reuses these layers
             self.in_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
             with torch.no_grad():
                 self.in_proj.weight.copy_(torch.eye(d_model))
@@ -156,6 +157,26 @@ class RoutingModule(nn.Module):
         boundary_score = boundary_score.view(B, L)  # (B, L)
         return boundary_score
     
+    def _compute_spatial_3d_causal_boundary(self, hidden_states, num_frames, num_rows, num_cols):
+        """Same as _compute_spatial_3d_boundary but causal temporal padding (past-only on T)."""
+        B, L, D = hidden_states.shape
+        x = F.normalize(self.in_proj(hidden_states), dim=-1)
+        x = x.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
+        # F.pad last dims: (W_left, W_right, H_left, H_right, T_left, T_right)
+        x = F.pad(x, (1, 1, 1, 1, 2, 0))
+        diff = F.conv3d(
+            x,
+            self.spatio_temp_conv.weight,
+            None,
+            stride=1,
+            padding=0,
+            dilation=1,
+            groups=D,
+        )
+        boundary_score = diff.mean(dim=1)  # (B, T, H, W)
+        boundary_score = boundary_score.view(B, L)  # (B, L)
+        return boundary_score
+    
     def _compute_temporal_boundary(self, hidden_states, num_frames, tokens_per_frame):
         """Compute boundary scores using temporal convolution.
         
@@ -210,6 +231,13 @@ class RoutingModule(nn.Module):
                 "num_frames, num_rows and num_cols required for spatial_3d routing"
             sim_score = self._compute_spatial_3d_boundary(hidden_states, num_frames, num_rows, num_cols)
             
+        elif self.routing_type == "spatial_3d_causal":
+            assert num_frames is not None and num_rows is not None and num_cols is not None, \
+                "num_frames, num_rows and num_cols required for spatial_3d_causal routing"
+            sim_score = self._compute_spatial_3d_causal_boundary(
+                hidden_states, num_frames, num_rows, num_cols
+            )
+            
         elif self.routing_type == "temporal":
             assert num_frames is not None, "num_frames required for temporal routing"
             tokens_per_frame = hidden_states.shape[1] // num_frames
@@ -236,7 +264,7 @@ class RoutingModule(nn.Module):
         elif self.routing_type == "causal":
             # Causal: force only first token to 1.0
             boundary_prob = F.pad(boundary_prob, (1, 0), "constant", PAD_PROB)
-        elif self.routing_type in ("spatial", "spatial_3d", "temporal"):
+        elif self.routing_type in ("spatial", "spatial_3d", "temporal", "spatial_3d_causal"):
             boundary_prob[:, 0] = PAD_PROB
             boundary_prob[:, -1] = PAD_PROB
 
@@ -507,6 +535,52 @@ def compute_spatial_3d_nearest_boundary_idx(
     return plug_back_idx
 
 
+def compute_spatial_3d_nearest_boundary_idx_causal(
+    boundary_mask: torch.Tensor,
+    num_frames: int,
+    num_rows: int,
+    num_cols: int
+) -> torch.Tensor:
+    """Like compute_spatial_3d_nearest_boundary_idx but only past/current-frame boundaries count."""
+    B, L = boundary_mask.shape
+    device = boundary_mask.device
+
+    frame_coords = torch.arange(num_frames, device=device).view(-1, 1, 1).expand(-1, num_rows, num_cols).flatten().float()
+    row_coords = torch.arange(num_rows, device=device).view(1, -1, 1).expand(num_frames, -1, num_cols).flatten().float()
+    col_coords = torch.arange(num_cols, device=device).view(1, 1, -1).expand(num_frames, num_rows, -1).flatten().float()
+
+    plug_back_idx = torch.zeros((B, L), dtype=torch.long, device=device)
+    position_chunk = 2048
+    for batch_idx in range(B):
+        current_boundaries = torch.where(boundary_mask[batch_idx])[0]
+        if current_boundaries.numel() == 0:
+            current_boundaries = torch.tensor([0], dtype=torch.long, device=device)
+
+        b_frames = frame_coords[current_boundaries]
+        b_rows = row_coords[current_boundaries]
+        b_cols = col_coords[current_boundaries]
+
+        nearest_parts = []
+        for pos_start in range(0, L, position_chunk):
+            pos_end = min(pos_start + position_chunk, L)
+            q_frames = frame_coords[pos_start:pos_end].unsqueeze(1)
+            q_rows = row_coords[pos_start:pos_end].unsqueeze(1)
+            q_cols = col_coords[pos_start:pos_end].unsqueeze(1)
+            dist = (
+                (q_frames - b_frames.unsqueeze(0)) ** 2
+                + (q_rows - b_rows.unsqueeze(0)) ** 2
+                + (q_cols - b_cols.unsqueeze(0)) ** 2
+            )
+            future_mask = b_frames.unsqueeze(0) > q_frames
+            dist = dist.masked_fill(future_mask, float("inf"))
+            nearest_parts.append(torch.argmin(dist, dim=1))
+
+        local_nearest = torch.cat(nearest_parts, dim=0)
+        plug_back_idx[batch_idx] = local_nearest
+
+    return plug_back_idx
+
+
 def _create_gaussian_kernel_1d(kernel_size: int, sigma: float, causal: bool = False):
     """Create a 1D Gaussian kernel for smoothing."""
     x = torch.arange(kernel_size) - kernel_size // 2
@@ -534,13 +608,14 @@ class DeChunkLayer(nn.Module):
     - 'nearest_1d': Each position uses the nearest boundary (1D distance)
     - 'nearest_2d': Each position uses the nearest boundary (2D spatial distance)
     - 'nearest_3d': Each position uses the nearest boundary (3D spatiotemporal distance)
+    - 'nearest_3d_causal': Nearest boundary in 3D among past/current frames only
     """
 
     def __init__(
         self,
         d_model: int,
         ema_scan_mode: str = "bidirectional",  # "causal" | "bidirectional" | "bidirectional_2d"
-        plug_back_mode: str = "causal",  # "causal" | "nearest_1d" | "nearest_2d" | "nearest_3d"
+        plug_back_mode: str = "causal",  # "causal" | "nearest_1d" | "nearest_2d" | "nearest_3d" | "nearest_3d_causal"
         smooth_mode: str = "ema",  # "ema" | "conv_gaussian" | "spatial_kernel"
         kernel_sigma: float = 1.0,  # sigma for spatial Gaussian kernel
         conv_kernel_size: int = 5,
@@ -548,6 +623,7 @@ class DeChunkLayer(nn.Module):
         dtype=torch.bfloat16,
         block_size: int = 256,
         headdim: int = 32,
+        causal_smooth: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -555,6 +631,7 @@ class DeChunkLayer(nn.Module):
         self.plug_back_mode = plug_back_mode
         self.smooth_mode = smooth_mode
         self.kernel_sigma = kernel_sigma
+        self.causal_smooth = causal_smooth
 
         if smooth_mode == "conv_gaussian":
             causal = (ema_scan_mode == "causal")
@@ -651,6 +728,17 @@ class DeChunkLayer(nn.Module):
         
         # Apply Gaussian kernel: K(d) = exp(-d² / 2σ²)
         kernel_weights = torch.exp(-dist_sq / (2 * self.kernel_sigma**2))
+        if (
+            self.causal_smooth
+            and num_frames is not None
+            and num_rows is not None
+            and num_cols is not None
+        ):
+            tokens_per_frame_local = num_rows * num_cols
+            frames_i = boundary_positions // tokens_per_frame_local
+            # Zero weight[i,j] when boundary j is temporally after boundary i
+            future_mask = frames_i.unsqueeze(1) > frames_i.unsqueeze(2)
+            kernel_weights = kernel_weights.masked_fill(future_mask, 0.0)
         
         # Weight by confidence P
         confidence_weights = p.unsqueeze(1)  # (B, 1, M)
@@ -805,6 +893,12 @@ class DeChunkLayer(nn.Module):
             assert num_frames is not None and num_rows is not None and num_cols is not None, \
                 "num_frames, num_rows and num_cols required for nearest_3d plug_back_mode"
             plug_back_idx = compute_spatial_3d_nearest_boundary_idx(
+                boundary_mask, num_frames, num_rows, num_cols
+            )
+        elif self.plug_back_mode == "nearest_3d_causal":
+            assert num_frames is not None and num_rows is not None and num_cols is not None, \
+                "num_frames, num_rows and num_cols required for nearest_3d_causal plug_back_mode"
+            plug_back_idx = compute_spatial_3d_nearest_boundary_idx_causal(
                 boundary_mask, num_frames, num_rows, num_cols
             )
         elif self.plug_back_mode == "nearest_2d":
