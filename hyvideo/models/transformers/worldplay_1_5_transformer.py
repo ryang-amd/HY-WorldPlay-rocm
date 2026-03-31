@@ -47,7 +47,7 @@ from hyvideo.utils.infer_utils import torch_compile_wrapper
 from hyvideo.models.text_encoders.byT5 import ByT5Mapper
 from hyvideo.commons.parallel_states import get_parallel_state
 
-from hyvideo.prope.camera_rope import prope_qkv
+from hyvideo.prope.camera_rope import prope_qkv, prope_qkv_chunked
 
 
 def is_blocks(n: str, m) -> bool:
@@ -323,16 +323,26 @@ class MMDoubleStreamBlock(nn.Module):
             img_mod2_gate,
         ) = self.modulate_img(vec, img)
 
-        # Add camera pose conditioning through ProPE (Projective Positional Encoding)
-        # delete rope components (original attn included)
-        # Apply ProPE transformation to Q, K, V using camera view matrices and intrinsics
-        img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
-            img_q.permute(0, 2, 1, 3),
-            img_k.permute(0, 2, 1, 3),
-            img_v.permute(0, 2, 1, 3),
-            viewmats=viewmats,
-            Ks=Ks,
-        )  # [batch, num_heads, seqlen, head_dim]
+        use_chunked_prope = (
+            viewmats is not None
+            and viewmats.shape[1] == img_q.shape[1]
+        )
+        if use_chunked_prope:
+            img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv_chunked(
+                img_q.permute(0, 2, 1, 3),
+                img_k.permute(0, 2, 1, 3),
+                img_v.permute(0, 2, 1, 3),
+                viewmats=viewmats,
+                Ks=Ks,
+            )
+        else:
+            img_q_prope, img_k_prope, img_v_prope, apply_fn_o = prope_qkv(
+                img_q.permute(0, 2, 1, 3),
+                img_k.permute(0, 2, 1, 3),
+                img_v.permute(0, 2, 1, 3),
+                viewmats=viewmats,
+                Ks=Ks,
+            )
         img_q_prope = img_q_prope.permute(
             0, 2, 1, 3
         )  # [batch, seqlen, num_heads, head_dim]
@@ -1388,27 +1398,108 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        # Pass through double-stream blocks
-        for index, block in enumerate(self.double_blocks):
-            self.attn_param["layer-name"] = f"double_block_{index + 1}"
+        num_double = len(self.double_blocks)
+        dc_active = (
+            hasattr(self, "dc_module")
+            and self.dc_module is not None
+            and not cache_vision
+        )
 
-            img, vision_kv = block(
-                bi_inference=False,
-                ar_txt_inference=False,
-                ar_vision_inference=True,
-                img=img,
-                vec=vec,
-                freqs_cis=freqs_cis,
-                attn_param=self.attn_param,
-                block_idx=index,
-                viewmats=viewmats,
-                Ks=Ks,
-                kv_cache=kv_cache,
-                cache_vision=cache_vision,
+        if not dc_active:
+            for index, block in enumerate(self.double_blocks):
+                self.attn_param["layer-name"] = f"double_block_{index + 1}"
+
+                img, vision_kv = block(
+                    bi_inference=False,
+                    ar_txt_inference=False,
+                    ar_vision_inference=True,
+                    img=img,
+                    vec=vec,
+                    freqs_cis=freqs_cis,
+                    attn_param=self.attn_param,
+                    block_idx=index,
+                    viewmats=viewmats,
+                    Ks=Ks,
+                    kv_cache=kv_cache,
+                    cache_vision=cache_vision,
+                )
+                if cache_vision:
+                    _kv_cache_new[index]["k_vision"] = vision_kv["k_vision"]
+                    _kv_cache_new[index]["v_vision"] = vision_kv["v_vision"]
+        else:
+            dc_start = self.dc_chunk_start_block
+            dc_end = self.dc_chunk_end_block
+
+            # Phase 1: pre-DC blocks (full resolution)
+            for index in range(min(dc_start, num_double)):
+                self.attn_param["layer-name"] = f"double_block_{index + 1}"
+                img, vision_kv = self.double_blocks[index](
+                    bi_inference=False,
+                    ar_txt_inference=False,
+                    ar_vision_inference=True,
+                    img=img, vec=vec,
+                    freqs_cis=freqs_cis,
+                    attn_param=self.attn_param,
+                    block_idx=index,
+                    viewmats=viewmats, Ks=Ks,
+                    kv_cache=kv_cache, cache_vision=False,
+                )
+
+            # Chunk img tokens
+            tokens_per_frame = th * tw
+            chunked_img, segment_states, merged_bpred = self.dc_module.chunk_with_temporal_segments(
+                hidden_states=img, mask=None,
+                num_frames=tt, num_rows=th, num_cols=tw,
             )
-            if cache_vision:
-                _kv_cache_new[index]["k_vision"] = vision_kv["k_vision"]
-                _kv_cache_new[index]["v_vision"] = vision_kv["v_vision"]
+            chunk_freqs_cos, chunk_freqs_sin = self.dc_module.gather_rope_for_segments(
+                freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+                segment_states=segment_states,
+            )
+            chunk_freqs_cis = (chunk_freqs_cos, chunk_freqs_sin) if chunk_freqs_cos is not None else None
+
+            vec_chunked = self.dc_module.gather_vec_for_segments(
+                vec, segment_states, tokens_per_frame, batch_size=bs,
+            )
+            viewmats_chunked, Ks_chunked = self.dc_module.gather_viewmats_for_segments(
+                viewmats, Ks, segment_states, tokens_per_frame, batch_size=bs,
+            )
+
+            # Phase 2: DC blocks (chunked img tokens)
+            for index in range(dc_start, min(dc_end, num_double)):
+                self.attn_param["layer-name"] = f"double_block_{index + 1}"
+                chunked_img, vision_kv = self.double_blocks[index](
+                    bi_inference=False,
+                    ar_txt_inference=False,
+                    ar_vision_inference=True,
+                    img=chunked_img, vec=vec_chunked,
+                    freqs_cis=chunk_freqs_cis,
+                    attn_param=self.attn_param,
+                    block_idx=index,
+                    viewmats=viewmats_chunked, Ks=Ks_chunked,
+                    kv_cache=kv_cache, cache_vision=False,
+                )
+
+            # Dechunk back to full resolution
+            img = self.dc_module.dechunk_with_temporal_segments(
+                chunked_states=chunked_img,
+                segment_states=segment_states,
+                mask=None, num_rows=th, num_cols=tw,
+            )
+
+            # Phase 3: post-DC blocks (full resolution)
+            for index in range(dc_end, num_double):
+                self.attn_param["layer-name"] = f"double_block_{index + 1}"
+                img, vision_kv = self.double_blocks[index](
+                    bi_inference=False,
+                    ar_txt_inference=False,
+                    ar_vision_inference=True,
+                    img=img, vec=vec,
+                    freqs_cis=freqs_cis,
+                    attn_param=self.attn_param,
+                    block_idx=index,
+                    viewmats=viewmats, Ks=Ks,
+                    kv_cache=kv_cache, cache_vision=False,
+                )
 
         if cache_vision:
             return _kv_cache_new

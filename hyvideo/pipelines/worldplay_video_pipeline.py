@@ -16,9 +16,11 @@
 
 
 import inspect
+import json
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -1070,6 +1072,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 )
 
         selected_frame_indices = []
+        _all_step_times_ms = []
+        _rollout_t0 = time.perf_counter()
 
         for chunk_i in range(self.chunk_num):
             if chunk_i > 0:
@@ -1171,6 +1175,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             start_idx = chunk_i * self.chunk_latent_frames
             end_idx = chunk_i * self.chunk_latent_frames + self.chunk_latent_frames
 
+            step_times_ms = []
+            _profile_chunk = (chunk_i == 1) if self.chunk_num > 1 else (chunk_i == 0)
             with (
                 self.progress_bar(total=self.num_inference_steps) as progress_bar,
                 auto_offload_model(
@@ -1197,6 +1203,20 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         [latent_model_input, cond_latents_input], dim=1
                     )
                     latents_concat = self.scheduler.scale_model_input(latents_concat, t)
+
+                    evt_start = torch.cuda.Event(enable_timing=True)
+                    evt_end = torch.cuda.Event(enable_timing=True)
+                    run_profiler = _profile_chunk and i == 2
+
+                    if run_profiler:
+                        profiler = torch.profiler.profile(
+                            activities=[torch.profiler.ProfilerActivity.CPU,
+                                        torch.profiler.ProfilerActivity.CUDA],
+                            with_flops=True,
+                        )
+                        profiler.__enter__()
+
+                    evt_start.record()
 
                     with torch.autocast(
                         device_type="cuda",
@@ -1241,6 +1261,17 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                                 start_rope_start_idx=len(selected_frame_indices),
                             )[0]
 
+                    evt_end.record()
+                    torch.cuda.synchronize()
+                    step_times_ms.append(evt_start.elapsed_time(evt_end))
+
+                    if run_profiler:
+                        profiler.__exit__(None, None, None)
+                        step_flops = sum(e.flops for e in profiler.key_averages() if e.flops and e.flops > 0)
+                        step_tflops = step_flops / 1e12
+                        dc_tag = "DC" if hasattr(self.transformer, "dc_module") and self.transformer.dc_module is not None else "baseline"
+                        print(f"[{dc_tag}] profiled step {i}: {step_tflops:.2f} TFLOPs/step")
+
                     if self.do_classifier_free_guidance:
                         noise_pred = noise_pred_uncond + self.guidance_scale * (
                             noise_pred - noise_pred_uncond
@@ -1259,6 +1290,149 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     ):
                         if progress_bar is not None:
                             progress_bar.update()
+
+            if step_times_ms:
+                dc_tag = "DC" if hasattr(self.transformer, "dc_module") and self.transformer.dc_module is not None else "baseline"
+                avg_ms = sum(step_times_ms) / len(step_times_ms)
+                print(f"[{dc_tag}] chunk {chunk_i}: {len(step_times_ms)} steps, "
+                      f"avg {avg_ms:.1f} ms/step, total {sum(step_times_ms):.0f} ms")
+                _all_step_times_ms.extend(step_times_ms)
+
+        _rollout_elapsed = time.perf_counter() - _rollout_t0
+        if _all_step_times_ms:
+            dc_tag = "DC" if hasattr(self.transformer, "dc_module") and self.transformer.dc_module is not None else "baseline"
+            total_steps = len(_all_step_times_ms)
+            avg_ms = sum(_all_step_times_ms) / total_steps
+            print(f"\n[{dc_tag}] === SUMMARY ===")
+            print(f"[{dc_tag}]   Total steps: {total_steps}")
+            print(f"[{dc_tag}]   Avg step time: {avg_ms:.1f} ms")
+            print(f"[{dc_tag}]   Denoising wall-clock: {_rollout_elapsed:.1f} s")
+
+        return latents
+
+    def dc_rollout(
+        self,
+        latents,
+        timesteps,
+        prompt_embeds,
+        prompt_mask,
+        vision_states,
+        cond_latents,
+        task_type,
+        extra_kwargs,
+        viewmats,
+        Ks,
+        action,
+        device,
+    ):
+        """Full-sequence denoising for DC training transformer.
+
+        Denoises all latent frames simultaneously (matching the training
+        forward pass) so the DC routing module sees the same full-sequence
+        input distribution it was trained on.
+        """
+        import time as _time
+
+        T = latents.shape[2]
+
+        with (
+            self.progress_bar(total=self.num_inference_steps) as progress_bar,
+            auto_offload_model(
+                self.transformer,
+                self.execution_device,
+                enabled=self.enable_offloading,
+            ),
+        ):
+            step_times_ms = []
+            for i, t in enumerate(timesteps):
+                t0 = _time.perf_counter()
+
+                timestep_input = torch.full(
+                    (T,), t, device=device, dtype=timesteps.dtype
+                )
+
+                latents_concat = torch.cat([latents, cond_latents], dim=1)
+                if self.do_classifier_free_guidance:
+                    latents_concat = torch.cat([latents_concat] * 2)
+                latents_concat = self.scheduler.scale_model_input(
+                    latents_concat, t
+                )
+
+                batch_size = latents_concat.shape[0]
+                t_expand = timestep_input.repeat(batch_size)
+                t_expand_txt = t.repeat(batch_size)
+
+                vm = repeat(
+                    viewmats, "B L H W -> (B R) L H W", R=batch_size
+                ).to(device)
+                ks = repeat(
+                    Ks, "B L H W -> (B R) L H W", R=batch_size
+                ).to(device)
+                act = (
+                    repeat(action, "B L -> (B R) L", R=batch_size)
+                    .reshape(-1)
+                    .to(device)
+                )
+
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=self.target_dtype,
+                    enabled=self.autocast_enabled,
+                ):
+                    output = self.transformer(
+                        hidden_states=latents_concat,
+                        timestep=t_expand,
+                        timestep_txt=t_expand_txt,
+                        text_states=prompt_embeds,
+                        text_states_2=None,
+                        encoder_attention_mask=prompt_mask,
+                        timestep_r=None,
+                        vision_states=vision_states,
+                        mask_type=task_type,
+                        guidance=None,
+                        return_dict=False,
+                        extra_kwargs=extra_kwargs,
+                        viewmats=vm.to(self.target_dtype),
+                        Ks=ks.to(self.target_dtype),
+                        action=act.to(self.target_dtype),
+                    )
+                    noise_pred = output[0]
+
+                if self.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+
+                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                    noise_pred = rescale_noise_cfg(
+                        noise_pred,
+                        noise_pred_text,
+                        guidance_rescale=self.guidance_rescale,
+                    )
+
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False
+                )[0]
+
+                dt_ms = (_time.perf_counter() - t0) * 1000
+                step_times_ms.append(dt_ms)
+
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > self.num_warmup_steps
+                    and (i + 1) % self.scheduler.order == 0
+                ):
+                    if progress_bar is not None:
+                        progress_bar.update()
+
+            if step_times_ms:
+                avg = sum(step_times_ms) / len(step_times_ms)
+                total_s = sum(step_times_ms) / 1000
+                logger.warning(
+                    "[DC dc_rollout] %d steps, avg %.0f ms/step, total %.1f s",
+                    len(step_times_ms), avg, total_s,
+                )
+
         return latents
 
     def bi_rollout(
@@ -1810,8 +1984,30 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         self.chunk_latent_frames = chunk_latent_frames
         self.num_inference_steps = num_inference_steps
 
+        if getattr(self.transformer, "_force_bi_rollout", False):
+            logger.warning(
+                "DC training transformer detected; using dc_rollout "
+                "(full-sequence denoising matching training forward)."
+            )
+            model_type = "dc"
+
         if model_type == "ar":
             latents = self.ar_rollout(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                prompt_mask=prompt_mask,
+                vision_states=vision_states,
+                cond_latents=cond_latents,
+                task_type=task_type,
+                extra_kwargs=extra_kwargs,
+                viewmats=viewmats,
+                Ks=Ks,
+                action=action,
+                device=device,
+            )
+        elif model_type == "dc":
+            latents = self.dc_rollout(
                 latents=latents,
                 timesteps=timesteps,
                 prompt_embeds=prompt_embeds,
@@ -2030,25 +2226,64 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             )
 
         vae_inference_config = cls.get_vae_inference_config()
-        transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-            os.path.join(cached_folder, "transformer", transformer_version),
-            torch_dtype=transformer_dtype,
-            low_cpu_mem_usage=True,
-        )
 
-        transformer.add_action_parameters()
+        ckpt_config = None
+        ckpt_class_name = None
+        dc_enabled_in_ckpt = False
+        use_training_dc_transformer = False
+        if action_ckpt is not None:
+            dc_config_path = os.path.join(os.path.dirname(action_ckpt), "config.json")
+            if os.path.exists(dc_config_path):
+                with open(dc_config_path, "r") as f:
+                    ckpt_config = json.load(f)
+                ckpt_class_name = ckpt_config.get("_class_name")
+                dc_enabled_in_ckpt = bool(ckpt_config.get("dc_enabled", False))
+                use_training_dc_transformer = (
+                    dc_enabled_in_ckpt
+                    and ckpt_class_name == "ARHunyuanVideo_1_5_DC_DiffusionTransformer"
+                )
+
+        if use_training_dc_transformer:
+            from trainer.models.hyvideo.models.transformers.ar_action_dc_hunyuanvideo_1_5_transformer import (
+                ARHunyuanVideo_1_5_DC_DiffusionTransformer,
+            )
+
+            init_kwargs = {
+                k: v for k, v in ckpt_config.items() if not k.startswith("_")
+            }
+            transformer = ARHunyuanVideo_1_5_DC_DiffusionTransformer(**init_kwargs)
+            transformer.add_discrete_action_parameters()
+            print(
+                "DC checkpoint detected; loading training transformer class: "
+                f"{ckpt_class_name}"
+            )
+        else:
+            transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
+                os.path.join(cached_folder, "transformer", transformer_version),
+                torch_dtype=transformer_dtype,
+                low_cpu_mem_usage=True,
+            )
+            transformer.add_action_parameters()
+
         if action_ckpt is not None:
             from safetensors.torch import load_file
 
             safetensor_path = action_ckpt
             state_dict = load_file(safetensor_path)
-            # Strip _orig_mod. prefix from keys saved by torch.compile-wrapped modules
-            if any("._orig_mod." in k for k in state_dict):
-                state_dict = {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+            if any("_orig_mod." in k for k in state_dict):
+                state_dict = {k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
                 print(f"Stripped _orig_mod. prefix from checkpoint keys (torch.compile artifact)")
+
+            dc_keys = [k for k in state_dict if k.startswith("dc_module.")]
+            if dc_keys and not use_training_dc_transformer:
+                for k in dc_keys:
+                    del state_dict[k]
+                print(f"Removed {len(dc_keys)} dc_module.* keys (DC not enabled in config)")
+
             transformer.load_state_dict(state_dict, strict=True)
             print("HY-World 1.5 loading from: ", action_ckpt)
 
+        setattr(transformer, "_force_bi_rollout", use_training_dc_transformer)
         transformer = transformer.to(transformer_dtype).to(transformer_init_device)
 
         infer_state = get_infer_state()
