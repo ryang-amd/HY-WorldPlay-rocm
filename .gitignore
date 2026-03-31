@@ -171,3 +171,7 @@ hyvideo/utils/rewrite/i2v_env.sh
 wandb/
 eval_outputs/
 pretrained_models/
+
+# AMD ROCm kernel caches
+.aiter_cache/
+.miopen_cache/
