@@ -1360,7 +1360,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
                 batch_size = latents_concat.shape[0]
                 t_expand = timestep_input.repeat(batch_size)
-                t_expand_txt = t.repeat(batch_size)
+                t_expand_txt = torch.zeros(batch_size, device=device, dtype=timesteps.dtype)
 
                 vm = repeat(
                     viewmats, "B L H W -> (B R) L H W", R=batch_size
@@ -1984,13 +1984,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         self.chunk_latent_frames = chunk_latent_frames
         self.num_inference_steps = num_inference_steps
 
-        if getattr(self.transformer, "_force_bi_rollout", False):
-            logger.warning(
-                "DC training transformer detected; using dc_rollout "
-                "(full-sequence denoising matching training forward)."
-            )
-            model_type = "dc"
-
         if model_type == "ar":
             latents = self.ar_rollout(
                 latents=latents,
@@ -2187,6 +2180,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         overlap_group_offloading=True,
         device=None,
         action_ckpt=None,
+        action_base_ckpt=None,
+        dc_disable=False,
         **kwargs,
     ):
         # use snapshot download here to get it working from from_pretrained
@@ -2228,62 +2223,91 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         vae_inference_config = cls.get_vae_inference_config()
 
         ckpt_config = None
-        ckpt_class_name = None
         dc_enabled_in_ckpt = False
-        use_training_dc_transformer = False
         if action_ckpt is not None:
             dc_config_path = os.path.join(os.path.dirname(action_ckpt), "config.json")
             if os.path.exists(dc_config_path):
                 with open(dc_config_path, "r") as f:
                     ckpt_config = json.load(f)
-                ckpt_class_name = ckpt_config.get("_class_name")
                 dc_enabled_in_ckpt = bool(ckpt_config.get("dc_enabled", False))
-                use_training_dc_transformer = (
-                    dc_enabled_in_ckpt
-                    and ckpt_class_name == "ARHunyuanVideo_1_5_DC_DiffusionTransformer"
-                )
 
-        if use_training_dc_transformer:
-            from trainer.models.hyvideo.models.transformers.ar_action_dc_hunyuanvideo_1_5_transformer import (
-                ARHunyuanVideo_1_5_DC_DiffusionTransformer,
-            )
+        pretrained_dir = os.path.join(
+            cached_folder, "transformer", transformer_version
+        )
 
-            init_kwargs = {
-                k: v for k, v in ckpt_config.items() if not k.startswith("_")
-            }
-            transformer = ARHunyuanVideo_1_5_DC_DiffusionTransformer(**init_kwargs)
-            transformer.add_discrete_action_parameters()
-            print(
-                "DC checkpoint detected; loading training transformer class: "
-                f"{ckpt_class_name}"
-            )
-        else:
-            transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-                os.path.join(cached_folder, "transformer", transformer_version),
-                torch_dtype=transformer_dtype,
-                low_cpu_mem_usage=True,
-            )
-            transformer.add_action_parameters()
+        transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
+            pretrained_dir,
+            torch_dtype=transformer_dtype,
+            low_cpu_mem_usage=True,
+        )
+        transformer.add_action_parameters()
 
         if action_ckpt is not None:
             from safetensors.torch import load_file
 
-            safetensor_path = action_ckpt
-            state_dict = load_file(safetensor_path)
+            # Two-stage loading: if a base action checkpoint is provided,
+            # load it first to get trained action parameters, then overlay
+            # the DC-only checkpoint on top.
+            if action_base_ckpt is not None:
+                base_sd = load_file(action_base_ckpt)
+                if any("_orig_mod." in k for k in base_sd):
+                    base_sd = {k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v for k, v in base_sd.items()}
+                transformer.load_state_dict(base_sd, strict=False)
+                print(f"Loaded base action checkpoint ({len(base_sd)} keys): {action_base_ckpt}")
+
+            state_dict = load_file(action_ckpt)
             if any("_orig_mod." in k for k in state_dict):
                 state_dict = {k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
                 print(f"Stripped _orig_mod. prefix from checkpoint keys (torch.compile artifact)")
 
-            dc_keys = [k for k in state_dict if k.startswith("dc_module.")]
-            if dc_keys and not use_training_dc_transformer:
-                for k in dc_keys:
-                    del state_dict[k]
-                print(f"Removed {len(dc_keys)} dc_module.* keys (DC not enabled in config)")
+            has_dc = any(k.startswith("dc_module.") for k in state_dict)
 
-            transformer.load_state_dict(state_dict, strict=True)
+            if dc_disable and has_dc:
+                print("DC_INFERENCE_DISABLE=1: skipping DC module, using base pretrained weights only")
+            if has_dc and dc_enabled_in_ckpt and not dc_disable:
+                dc_kwargs = {}
+                if ckpt_config:
+                    dc_key_map = {
+                        "dc_downsample_factor": "dc_downsample_factor",
+                        "dc_routing_type": "dc_routing_type",
+                        "dc_encoder_direction": "dc_encoder_direction",
+                        "dc_dechunk_scan_mode": "dc_dechunk_scan_mode",
+                        "dc_plug_back_mode": "dc_plug_back_mode",
+                        "dc_smooth_mode": "dc_smooth_mode",
+                        "dc_use_ste": "dc_use_ste",
+                        "dc_encoder_conditional": "dc_encoder_conditional",
+                        "dc_ratio_loss_weight": "dc_ratio_loss_weight",
+                        "dc_causal_smooth": "dc_causal_smooth",
+                        "dc_chunk_start_block": "dc_chunk_start_block",
+                        "dc_chunk_end_block": "dc_chunk_end_block",
+                    }
+                    for cfg_key, arg_key in dc_key_map.items():
+                        if cfg_key in ckpt_config:
+                            dc_kwargs[arg_key] = ckpt_config[cfg_key]
+                transformer.add_dc_module(**dc_kwargs)
+                print(f"DC module added to inference transformer "
+                      f"(blocks {transformer.dc_chunk_start_block}-{transformer.dc_chunk_end_block})")
+
+            missing, unexpected = transformer.load_state_dict(state_dict, strict=not has_dc)
+            if has_dc and missing:
+                print(f"DC checkpoint: {len(missing)} keys kept from pretrained "
+                      f"(loaded {len(state_dict)} trained keys)")
             print("HY-World 1.5 loading from: ", action_ckpt)
 
-        setattr(transformer, "_force_bi_rollout", use_training_dc_transformer)
+            if has_dc and dc_enabled_in_ckpt and not dc_disable and hasattr(transformer, "dc_module"):
+                _dc = transformer.dc_module
+                if hasattr(_dc, "residual_proj") and _dc.residual_proj is not None:
+                    w = _dc.residual_proj.weight.data.float()
+                    eye = torch.eye(w.shape[0], w.shape[1], device=w.device)
+                    frob_dist = (w - eye).norm().item()
+                    print(f"[DC-WEIGHT] residual_proj: Frobenius distance from identity = {frob_dist:.6f}")
+                if hasattr(_dc, "routing_module") and _dc.routing_module is not None:
+                    for name, param in _dc.routing_module.named_parameters():
+                        p = param.data.float()
+                        print(f"[DC-WEIGHT] routing_module.{name}: "
+                              f"mean={p.mean().item():.6f}, std={p.std().item():.6f}, "
+                              f"norm={p.norm().item():.6f}, shape={list(p.shape)}")
+
         transformer = transformer.to(transformer_dtype).to(transformer_init_device)
 
         infer_state = get_infer_state()

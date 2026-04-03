@@ -1,10 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Inference Comparison: Baseline (ar_rollout) vs DC (dc_rollout)
-#
-# Baseline uses the inference-side transformer with ar_rollout.
-# DC uses the training-side DC transformer with dc_rollout
-# (full-sequence denoising matching training forward).
+# Inference: DC-enabled (ar_rollout) — DC v3 (Q-K routing, zero residual)
 # ============================================================
 set -euo pipefail
 
@@ -13,6 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 source /home/ruijyang/miniconda3/etc/profile.d/conda.sh
 conda activate hunyuan
+source "${REPO_ROOT}/setup_rock_env.sh"
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
@@ -32,11 +29,7 @@ mkdir -p "${AITER_TUNE_DIR}"
 # ============================================================
 MODEL_PATH=/data/ruijyang/pretrained_models/hunyuanwp/HunyuanVideo-1.5
 BASELINE_CKPT=/data/ruijyang/training_output/baseline_benchmark/checkpoint-500/transformer/diffusion_pytorch_model.safetensors
-DC_CKPT=/data/ruijyang/training_output/run_dc_v1_causal_routing_bidir_recon/checkpoint-500/transformer/diffusion_pytorch_model.safetensors
-
-BASELINE_OUTPUT="${REPO_ROOT}/eval_outputs/baseline_dc_rollout"
-DC_OUTPUT="${REPO_ROOT}/eval_outputs/dc_dc_rollout"
-mkdir -p "${BASELINE_OUTPUT}" "${DC_OUTPUT}"
+DC_CKPT=/data/ruijyang/training_output/run_dc_v2_no_temporal_causal/checkpoint-500/transformer/diffusion_pytorch_model.safetensors
 
 NUM_GPUS=8
 MASTER_PORT=29612
@@ -51,19 +44,17 @@ NUM_FRAMES=125
 SEED=1
 
 # ============================================================
-# Run 1: Baseline -- SKIPPED (reuse eval_baseline_vs_dc_v1.log)
-# Same checkpoint, prompt, seed, 125 frames, ar_rollout.
-# Baseline video: eval_outputs/baseline_500_timing/gen.mp4
+# Run: DC-enabled (ar_rollout with DC module in forward_vision)
 # ============================================================
+DC_ON_OUTPUT="${REPO_ROOT}/eval_outputs/dc_v3_qk_routing_tune_params_0403"
+mkdir -p "${DC_ON_OUTPUT}"
 
-# ============================================================
-# Run 2: DC (dc_rollout with training-side DC transformer)
-# ============================================================
 echo ""
 echo "============================================================"
-echo "  Running DC inference (dc_rollout, 125 frames)"
-echo "  Checkpoint: ${DC_CKPT}"
-echo "  Output:     ${DC_OUTPUT}"
+echo "  DC-enabled inference (Q-K routing, zero residual)"
+echo "  Base ckpt:  ${BASELINE_CKPT}"
+echo "  DC ckpt:    ${DC_CKPT}"
+echo "  Output:     ${DC_ON_OUTPUT}"
 echo "============================================================"
 echo ""
 
@@ -78,8 +69,9 @@ torchrun --nproc_per_node=${NUM_GPUS} --master_port=$((MASTER_PORT + 1)) \
     --rewrite false \
     --sr false --save_pre_sr_video \
     --pose "${POSE}" \
-    --output_path "${DC_OUTPUT}" \
+    --output_path "${DC_ON_OUTPUT}" \
     --model_path "${MODEL_PATH}" \
+    --action_base_ckpt "${BASELINE_CKPT}" \
     --action_ckpt "${DC_CKPT}" \
     --few_step false \
     --model_type ar \
@@ -89,8 +81,6 @@ torchrun --nproc_per_node=${NUM_GPUS} --master_port=$((MASTER_PORT + 1)) \
 
 echo ""
 echo "============================================================"
-echo "  Both runs complete. Videos saved to:"
-echo "    Baseline: ${BASELINE_OUTPUT}"
-echo "    DC:       ${DC_OUTPUT}"
-echo "  Check logs for [DC dc_rollout] timing summary."
+echo "  Inference complete. Video saved to:"
+echo "    DC-enabled: ${DC_ON_OUTPUT}"
 echo "============================================================"

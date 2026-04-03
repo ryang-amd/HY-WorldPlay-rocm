@@ -43,6 +43,9 @@ from .modules.modulate_layers import ModulateDiT, modulate, apply_gate
 from .modules.token_refiner import SingleTokenRefiner
 
 from hyvideo.utils.communications import all_gather
+from hyvideo.commons.parallel_states import suspend_sp
+import os as _os
+import torch.distributed as _dist
 from hyvideo.utils.infer_utils import torch_compile_wrapper
 from hyvideo.models.text_encoders.byT5 import ByT5Mapper
 from hyvideo.commons.parallel_states import get_parallel_state
@@ -1167,6 +1170,51 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
             if block.img_attn_prope_proj.bias is not None:
                 nn.init.zeros_(block.img_attn_prope_proj.bias)
 
+    def add_dc_module(
+        self,
+        dc_downsample_factor: float = 4.0,
+        dc_routing_type: str = "spatial_3d",
+        dc_encoder_direction: str = "bidirectional_2d",
+        dc_dechunk_scan_mode: str = "bidirectional_2d",
+        dc_plug_back_mode: str = "nearest_3d",
+        dc_smooth_mode: str = "spatial_kernel",
+        dc_use_ste: bool = True,
+        dc_encoder_conditional: bool = True,
+        dc_ratio_loss_weight: float = 0.03,
+        dc_causal_smooth: bool = False,
+        dc_chunk_start_block: int = 10,
+        dc_chunk_end_block: int = -1,
+    ):
+        from trainer.models.hyvideo.models.transformers.ar_action_dc_hunyuanvideo_1_5_transformer import (
+            DynamicChunkingModule,
+            DynamicChunkingConfig,
+        )
+
+        num_double = len(self.double_blocks)
+        self.dc_enabled = True
+        self.dc_chunk_start_block = dc_chunk_start_block
+        self.dc_chunk_end_block = dc_chunk_end_block if dc_chunk_end_block >= 0 else num_double
+
+        dc_config = DynamicChunkingConfig(
+            enabled=True,
+            downsample_factor=dc_downsample_factor,
+            routing_module_type=[dc_routing_type, None],
+            encoder_conditional=dc_encoder_conditional,
+            encoder_direction=[dc_encoder_direction, None],
+            dechunk_ema_scan_mode=[dc_dechunk_scan_mode, None],
+            dechunk_plug_back_mode=[dc_plug_back_mode, None],
+            dechunk_smooth_mode=[dc_smooth_mode, None],
+            use_ste=dc_use_ste,
+            ratio_loss_weight=dc_ratio_loss_weight,
+            causal_smooth=dc_causal_smooth,
+        )
+
+        self.dc_module = DynamicChunkingModule(
+            hidden_size=self.hidden_size,
+            config=dc_config,
+        )
+        self._dc_diag_logged = False
+
     def get_text_and_mask(
         self,
         encoder_attention_mask,
@@ -1376,10 +1424,17 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         # Sequence parallel: split spatial tokens across multiple GPUs for memory efficiency
         parallel_dims = get_parallel_state()
         sp_enabled = parallel_dims.sp_enabled
+
+        # Keep full (pre-SP-split) copies for DC which needs per-frame spatial info
+        full_freqs_cos = freqs_cos
+        full_freqs_sin = freqs_sin
+        full_vec = rearrange(vec, "B S C -> (B S) C")
+        full_viewmats = viewmats
+        full_Ks = Ks
+
         if sp_enabled:
             sp_size = parallel_dims.sp
             sp_rank = parallel_dims.sp_rank
-            # Verify sequence length is sufficient for parallelization
             if img.shape[1] % sp_size != 0:
                 n_token = img.shape[1]
                 assert n_token > (n_token // sp_size + 1) * (
@@ -1402,7 +1457,6 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
         dc_active = (
             hasattr(self, "dc_module")
             and self.dc_module is not None
-            and not cache_vision
         )
 
         if not dc_active:
@@ -1442,49 +1496,113 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                     attn_param=self.attn_param,
                     block_idx=index,
                     viewmats=viewmats, Ks=Ks,
-                    kv_cache=kv_cache, cache_vision=False,
+                    kv_cache=kv_cache, cache_vision=cache_vision,
+                )
+                if cache_vision:
+                    _kv_cache_new[index]["k_vision"] = vision_kv["k_vision"]
+                    _kv_cache_new[index]["v_vision"] = vision_kv["v_vision"]
+
+            # DC routing needs the full (non-SP-split) sequence.
+            if sp_enabled:
+                img = all_gather(img, dim=1)
+            full_freqs_cis = (full_freqs_cos, full_freqs_sin) if full_freqs_cos is not None else None
+
+            _dc_bypass = _os.environ.get("DC_BYPASS", "0") == "1"
+            _dc_should_log = (
+                not self._dc_diag_logged
+                and not cache_vision
+                and (not _dist.is_initialized() or _dist.get_rank() == 0)
+            )
+
+            img_norm_before_chunk = img.norm().item() if _dc_should_log else None
+
+            with suspend_sp():
+                tokens_per_frame = th * tw
+                chunked_img, chunk_state, merged_bpred = self.dc_module.chunk(
+                    hidden_states=img, num_frames=tt, num_rows=th, num_cols=tw,
                 )
 
-            # Chunk img tokens
-            tokens_per_frame = th * tw
-            chunked_img, segment_states, merged_bpred = self.dc_module.chunk_with_temporal_segments(
-                hidden_states=img, mask=None,
-                num_frames=tt, num_rows=th, num_cols=tw,
-            )
-            chunk_freqs_cos, chunk_freqs_sin = self.dc_module.gather_rope_for_segments(
-                freqs_cos=freqs_cos, freqs_sin=freqs_sin,
-                segment_states=segment_states,
-            )
-            chunk_freqs_cis = (chunk_freqs_cos, chunk_freqs_sin) if chunk_freqs_cos is not None else None
+                if _dc_should_log:
+                    total_tokens = img.shape[1]
+                    chunked_tokens = chunked_img.shape[1]
+                    ratio = chunked_tokens / max(total_tokens, 1)
+                    print(f"[DC-DIAG] Routing: {chunked_tokens}/{total_tokens} "
+                          f"tokens kept ({ratio:.3f}), "
+                          f"frames={tt}, tokens/frame={tokens_per_frame}")
+                    print(f"[DC-DIAG] Norms: img_before_chunk={img_norm_before_chunk:.4f}, "
+                          f"chunked_img={chunked_img.norm().item():.4f}")
+                    if _dc_bypass:
+                        print("[DC-DIAG] DC_BYPASS=1: skipping Phase 2 blocks, "
+                              "chunk->dechunk identity test")
 
-            vec_chunked = self.dc_module.gather_vec_for_segments(
-                vec, segment_states, tokens_per_frame, batch_size=bs,
-            )
-            viewmats_chunked, Ks_chunked = self.dc_module.gather_viewmats_for_segments(
-                viewmats, Ks, segment_states, tokens_per_frame, batch_size=bs,
-            )
+                chunk_freqs_cos, chunk_freqs_sin = self.dc_module.gather_rope(
+                    full_freqs_cos, full_freqs_sin, chunk_state,
+                )
+                chunk_freqs_cis = (chunk_freqs_cos, chunk_freqs_sin) if chunk_freqs_cos is not None else None
 
-            # Phase 2: DC blocks (chunked img tokens)
-            for index in range(dc_start, min(dc_end, num_double)):
-                self.attn_param["layer-name"] = f"double_block_{index + 1}"
-                chunked_img, vision_kv = self.double_blocks[index](
-                    bi_inference=False,
-                    ar_txt_inference=False,
-                    ar_vision_inference=True,
-                    img=chunked_img, vec=vec_chunked,
-                    freqs_cis=chunk_freqs_cis,
-                    attn_param=self.attn_param,
-                    block_idx=index,
-                    viewmats=viewmats_chunked, Ks=Ks_chunked,
-                    kv_cache=kv_cache, cache_vision=False,
+                vec_chunked = self.dc_module.gather_vec(
+                    full_vec, chunk_state, tokens_per_frame, batch_size=bs,
+                )
+                viewmats_chunked, Ks_chunked = self.dc_module.gather_viewmats(
+                    full_viewmats, full_Ks, chunk_state, tokens_per_frame, batch_size=bs,
                 )
 
-            # Dechunk back to full resolution
-            img = self.dc_module.dechunk_with_temporal_segments(
-                chunked_states=chunked_img,
-                segment_states=segment_states,
-                mask=None, num_rows=th, num_cols=tw,
-            )
+                # KV cache has SP-split heads (H_local). Phase 2 runs with SP
+                # suspended (H_total). Gather cached KV to full heads, restore after.
+                saved_kv = {}
+                if sp_enabled and kv_cache is not None:
+                    _kv_keys = ("k_txt", "v_txt", "k_vision", "v_vision")
+                    for idx in range(dc_start, min(dc_end, num_double)):
+                        saved_kv[idx] = {}
+                        for kn in _kv_keys:
+                            orig = kv_cache[idx].get(kn)
+                            saved_kv[idx][kn] = orig
+                            if orig is not None:
+                                kv_cache[idx][kn] = all_gather(orig, dim=1)
+
+                if not _dc_bypass:
+                    # Phase 2: DC blocks (chunked space, SP suspended)
+                    for index in range(dc_start, min(dc_end, num_double)):
+                        self.attn_param["layer-name"] = f"double_block_{index + 1}"
+                        chunked_img, vision_kv = self.double_blocks[index](
+                            bi_inference=False,
+                            ar_txt_inference=False,
+                            ar_vision_inference=True,
+                            img=chunked_img, vec=vec_chunked,
+                            freqs_cis=chunk_freqs_cis,
+                            attn_param=self.attn_param,
+                            block_idx=index,
+                            viewmats=viewmats_chunked, Ks=Ks_chunked,
+                            kv_cache=kv_cache, cache_vision=cache_vision,
+                        )
+                        if cache_vision:
+                            kv_k = vision_kv["k_vision"]
+                            kv_v = vision_kv["v_vision"]
+                            if sp_enabled:
+                                h_local = kv_k.shape[1] // sp_size
+                                kv_k = kv_k[:, sp_rank * h_local:(sp_rank + 1) * h_local]
+                                kv_v = kv_v[:, sp_rank * h_local:(sp_rank + 1) * h_local]
+                            _kv_cache_new[index]["k_vision"] = kv_k
+                            _kv_cache_new[index]["v_vision"] = kv_v
+
+                # Restore original SP-split KV cache
+                if saved_kv:
+                    for idx in saved_kv:
+                        for kn, orig_val in saved_kv[idx].items():
+                            kv_cache[idx][kn] = orig_val
+
+                img = self.dc_module.dechunk(
+                    chunked_states=chunked_img, state=chunk_state,
+                    num_rows=th, num_cols=tw,
+                )
+
+                if _dc_should_log:
+                    print(f"[DC-DIAG] Norms: img_after_dechunk={img.norm().item():.4f}")
+                    self._dc_diag_logged = True
+
+            # Re-split for SP after dechunk
+            if sp_enabled:
+                img = torch.chunk(img, sp_size, dim=1)[sp_rank]
 
             # Phase 3: post-DC blocks (full resolution)
             for index in range(dc_end, num_double):
@@ -1498,8 +1616,11 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
                     attn_param=self.attn_param,
                     block_idx=index,
                     viewmats=viewmats, Ks=Ks,
-                    kv_cache=kv_cache, cache_vision=False,
+                    kv_cache=kv_cache, cache_vision=cache_vision,
                 )
+                if cache_vision:
+                    _kv_cache_new[index]["k_vision"] = vision_kv["k_vision"]
+                    _kv_cache_new[index]["v_vision"] = vision_kv["v_vision"]
 
         if cache_vision:
             return _kv_cache_new
