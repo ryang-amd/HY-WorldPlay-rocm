@@ -26,40 +26,21 @@ class TestDynamicChunkingV1(unittest.TestCase):
         return DynamicChunkingModule(
             hidden_size=16,
             config=config,
-            temporal_boundary_threshold=0.5,
-            temporal_min_chunk_frames=2,
-            temporal_max_chunk_frames=6,
-            temporal_target_chunk_frames=4,
         )
-
-    def test_temporal_segments_cover_full_range(self):
-        module = self._build_module()
-        x = torch.randn(2, 20 * 6, 16)
-        segments = module._predict_temporal_segments(
-            hidden_states=x,
-            num_frames=20,
-            num_rows=2,
-            num_cols=3,
-        )
-        self.assertGreaterEqual(len(segments), 1)
-        self.assertEqual(segments[0][0], 0)
-        self.assertEqual(segments[-1][1], 20)
-        for start, end in segments:
-            self.assertGreater(end, start)
 
     def test_chunk_dechunk_roundtrip_shape(self):
         module = self._build_module()
         x = torch.randn(1, 12 * 4, 16)
-        chunked, segment_states, _ = module.chunk_with_temporal_segments(
+        chunked, state, _ = module.chunk(
             hidden_states=x,
             num_frames=12,
             num_rows=2,
             num_cols=2,
             mask=None,
         )
-        restored = module.dechunk_with_temporal_segments(
+        restored = module.dechunk(
             chunked_states=chunked,
-            segment_states=segment_states,
+            state=state,
             num_rows=2,
             num_cols=2,
             mask=None,

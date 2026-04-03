@@ -727,6 +727,8 @@ def generate_video(args):
         force_sparse_attn=False,
         transformer_dtype=transformer_dtype,
         action_ckpt=args.action_ckpt,
+        action_base_ckpt=args.action_base_ckpt,
+        dc_disable=args.dc_disable,
     )
 
     extra_kwargs = {}
@@ -857,6 +859,14 @@ def main():
     )
     parser.add_argument(
         "--action_ckpt", type=str, required=True, help="Path to pretrained action model"
+    )
+    parser.add_argument(
+        "--action_base_ckpt", type=str, default=None,
+        help="Path to base action checkpoint (provides action params when action_ckpt only has DC weights)"
+    )
+    parser.add_argument(
+        "--dc_disable", action="store_true", default=False,
+        help="Disable DC module even if checkpoint contains DC weights"
     )
     parser.add_argument(
         "--aspect_ratio", type=str, default="16:9", help="Aspect ratio (default: 16:9)"

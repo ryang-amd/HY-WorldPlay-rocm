@@ -84,3 +84,20 @@ def get_parallel_state():
         # create default parallel states (without enabling any parallelism)
         initialize_parallel_state()
     return __parallel_dims
+
+
+class suspend_sp:
+    """Context manager that temporarily disables sequence parallelism.
+
+    Used when a code section (e.g. DC chunk/dechunk) needs to operate
+    on the full gathered sequence rather than SP-split shards.
+    """
+
+    def __enter__(self):
+        dims = get_parallel_state()
+        self._saved_sp = dims.sp
+        dims.sp = 1
+        return dims
+
+    def __exit__(self, *exc):
+        get_parallel_state().sp = self._saved_sp

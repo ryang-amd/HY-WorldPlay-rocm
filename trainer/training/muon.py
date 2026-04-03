@@ -96,18 +96,24 @@ class Muon(torch.optim.Optimizer):
 
         params = list(muon_params)
         adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
-        super().__init__(params, defaults)
-
-        # DC params get their own group with a scaled learning rate.
         dc_adamw_params = list(dc_adamw_params) if dc_adamw_params else []
-        if dc_adamw_params:
-            dc_group = dict(defaults)
-            dc_group["lr"] = lr * dc_lr_multiplier
-            dc_group["params"] = dc_adamw_params
-            self.param_groups.append(dc_group)
+        params.extend(adamw_params)
+
+        if not params and dc_adamw_params:
+            dc_defaults = dict(defaults)
+            dc_defaults["lr"] = lr * dc_lr_multiplier
+            super().__init__(dc_adamw_params, dc_defaults)
             for p in dc_adamw_params:
                 self.state[p]["use_muon"] = False
+        else:
+            super().__init__(params, defaults)
+            if dc_adamw_params:
+                dc_group = dict(defaults)
+                dc_group["lr"] = lr * dc_lr_multiplier
+                dc_group["params"] = dc_adamw_params
+                self.param_groups.append(dc_group)
+                for p in dc_adamw_params:
+                    self.state[p]["use_muon"] = False
 
         for p in muon_params:
             assert p.ndim >= 2, p.ndim

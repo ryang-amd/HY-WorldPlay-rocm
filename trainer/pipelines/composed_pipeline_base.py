@@ -89,6 +89,28 @@ class ComposedPipelineBase(ABC):
                 else:
                     module.requires_grad_(False)
 
+            freeze_base = getattr(self.trainer_args, "freeze_base_dit", False)
+            if freeze_base and "transformer" in self.modules:
+                transformer = self.modules["transformer"]
+                trainable_prefixes = ("dc_module.", "action_in.")
+                n_frozen = 0
+                n_trainable = 0
+                for pname, param in transformer.named_parameters():
+                    keep = any(
+                        pname.startswith(pfx) or f".{pfx}" in pname
+                        for pfx in trainable_prefixes
+                    )
+                    if keep:
+                        param.requires_grad_(True)
+                        n_trainable += 1
+                    else:
+                        param.requires_grad_(False)
+                        n_frozen += 1
+                logger.info(
+                    "freeze_base_dit: frozen %d base DiT params, "
+                    "training %d (DC + action) params", n_frozen, n_trainable,
+                )
+
     def post_init(self) -> None:
         assert self.trainer_args is not None, "trainer_args must be set"
         if self.post_init_called:
