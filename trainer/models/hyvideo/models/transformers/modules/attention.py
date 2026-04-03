@@ -228,36 +228,43 @@ def sequence_parallel_attention(q, k, v,
 
     # Chunk-wise causal attention for AR model.
     # Uses AITER flash attention when available; otherwise cached-mask SDPA.
+    #
+    # When attn_param contains 'dc_chunk_offsets', the vision sequence has been
+    # compressed by dynamic chunking and the offsets list gives the variable-
+    # length boundaries of each temporal chunk in the DC'd sequence.  Otherwise
+    # fixed 4-frame chunks of 1560*4=6240 tokens are assumed.
     elif attn_mode == "torch_causal":
         vision_seq_length = query.shape[1]
         text_seq_length = encoder_query.shape[1]
 
-        LATENT_SEQ_LENGTH = 1560   # per-frame spatial tokens for 480x832
-        CHUNK_SEQ_LENGTH = LATENT_SEQ_LENGTH * 4
-        chunk_num = (vision_seq_length + CHUNK_SEQ_LENGTH - 1) // CHUNK_SEQ_LENGTH
+        dc_offsets = attn_param.get('dc_chunk_offsets') if attn_param else None
+        if dc_offsets is not None:
+            chunk_num = len(dc_offsets) - 1
+            use_aiter = False  # variable DC chunks have irregular sizes incompatible with AITER kernels
+        else:
+            LATENT_SEQ_LENGTH = 1560
+            CHUNK_SEQ_LENGTH = LATENT_SEQ_LENGTH * 4
+            chunk_num = (vision_seq_length + CHUNK_SEQ_LENGTH - 1) // CHUNK_SEQ_LENGTH
+            dc_offsets = [min(i * CHUNK_SEQ_LENGTH, vision_seq_length) for i in range(chunk_num + 1)]
+            use_aiter = (_aiter_module is not None)
 
-        if _aiter_module is not None:
-            # ---- AITER path: chunk-by-chunk flash attention, no mask ----
+        if use_aiter:
             B = query.shape[0]
 
-            # Expand text encoder tokens to match vision batch size (text may be B=1)
             enc_q = encoder_query.expand(B, -1, -1, -1)
             enc_k = encoder_key.expand(B, -1, -1, -1)
             enc_v = encoder_value.expand(B, -1, -1, -1)
 
-            # 1. Text self-attention (text tokens attend to all text)
             text_out, *_ = _aiter_module.flash_attn_func(
                 enc_q, enc_k, enc_v,
                 causal=False, return_lse=True,
             )
 
-            # 2. Per-chunk vision attention
-            #    Each chunk attends to text + all vision chunks up to itself.
             chunk_outputs = []
             for i in range(chunk_num):
-                c_start = i * CHUNK_SEQ_LENGTH
-                c_end = min(c_start + CHUNK_SEQ_LENGTH, vision_seq_length)
-                kv_end = min((i + 1) * CHUNK_SEQ_LENGTH, vision_seq_length)
+                c_start = dc_offsets[i]
+                c_end = dc_offsets[i + 1]
+                kv_end = dc_offsets[i + 1]
 
                 chunk_q = query[:, c_start:c_end]
                 kv_k = torch.cat([enc_k, key[:, :kv_end]], dim=1)
@@ -269,31 +276,28 @@ def sequence_parallel_attention(q, k, v,
                 )
                 chunk_outputs.append(chunk_out)
 
-            # 3. Output in [vision, text] order
             vision_out = torch.cat(chunk_outputs, dim=1)
             hidden_states = torch.cat([vision_out, text_out], dim=1)
 
         else:
-            # ---- Fallback: cached-mask SDPA (no AITER) ----
             total_seq_length = vision_seq_length + text_seq_length
 
             all_query = torch.cat([encoder_query, query], dim=1)
             all_key = torch.cat([encoder_key, key], dim=1)
             all_value = torch.cat([encoder_value, value], dim=1)
 
-            # Retrieve or create the cached mask
-            cache_key = (vision_seq_length, text_seq_length, all_query.device)
+            cache_key = (vision_seq_length, text_seq_length, tuple(dc_offsets), all_query.device)
             if cache_key not in _causal_mask_cache:
                 causal_mask = torch.zeros(
                     (total_seq_length, total_seq_length),
                     device=all_query.device)
                 causal_mask[:, :text_seq_length] = 1
                 for ci in range(chunk_num):
-                    s_i = text_seq_length + ci * CHUNK_SEQ_LENGTH
-                    e_i = min(s_i + CHUNK_SEQ_LENGTH, total_seq_length)
+                    s_i = text_seq_length + dc_offsets[ci]
+                    e_i = text_seq_length + dc_offsets[ci + 1]
                     for cj in range(ci + 1):
-                        s_j = text_seq_length + cj * CHUNK_SEQ_LENGTH
-                        e_j = min(s_j + CHUNK_SEQ_LENGTH, total_seq_length)
+                        s_j = text_seq_length + dc_offsets[cj]
+                        e_j = text_seq_length + dc_offsets[cj + 1]
                         causal_mask[s_i:e_i, s_j:e_j] = 1
                 _causal_mask_cache[cache_key] = (
                     causal_mask.unsqueeze(0).unsqueeze(0).to(torch.bool))
@@ -310,7 +314,6 @@ def sequence_parallel_attention(q, k, v,
 
             hidden_states = hidden_states.transpose(1, 2)
 
-            # Reorder from [text, vision] to [vision, text]
             hidden_states = torch.cat([
                 hidden_states[:, text_seq_length:, :, :],
                 hidden_states[:, :text_seq_length, :, :],
