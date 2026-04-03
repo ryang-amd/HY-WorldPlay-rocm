@@ -33,7 +33,7 @@
 
     "dc_enabled": true,
     "dc_downsample_factor": 4.0,
-    "dc_routing_type": "spatial_3d_causal",
+    "dc_routing_type": "spatial_3d",
     "dc_encoder_direction": "bidirectional_2d",
     "dc_dechunk_scan_mode": "bidirectional_2d",
     "dc_plug_back_mode": "nearest_3d",
@@ -41,12 +41,7 @@
     "dc_causal_smooth": false,
     "dc_use_ste": true,
     "dc_encoder_conditional": true,
-    "dc_ratio_loss_weight": 0.03,
-    "dc_temporal_boundary_threshold": 0.5,
-    "dc_temporal_min_chunk_frames": 2,
-    "dc_temporal_max_chunk_frames": 8,
-    "dc_temporal_target_chunk_frames": 4,
-    "dc_temporal_loss_weight": 0.2,
+    "dc_ratio_loss_weight": 1.0,
     "dc_chunk_start_block": 10,
     "dc_chunk_end_block": 44,
 

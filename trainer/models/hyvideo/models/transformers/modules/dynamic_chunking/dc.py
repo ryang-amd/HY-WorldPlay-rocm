@@ -48,8 +48,7 @@ class RoutingModule(nn.Module):
     - 'temporal': Uses temporal convolution for video frames
     
     For video data with temporal dimension, supports:
-    - 'spatial_3d': 3D convolution considering T, H, W
-    - 'spatial_3d_causal': Same layers as spatial_3d; causal temporal padding in forward
+    - 'spatial_3d': Q-K cosine similarity with 3D conv (T, H, W), center excluded
     - 'temporal': Only temporal dimension routing
     """
 
@@ -58,6 +57,7 @@ class RoutingModule(nn.Module):
         d_model: int, 
         routing_type: str = "bidirectional",
         temporal_kernel_size: int = 3,
+        spatial_kernel_size: int = 3,
         device=None, 
         dtype=None
     ):
@@ -66,50 +66,44 @@ class RoutingModule(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         
-        if routing_type == "spatial":
-            # 2D spatial routing (for single frames or 2D patches)
-            self.in_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        if routing_type in ("spatial", "spatial_3d"):
+            # Q-K projections with identity init (matching DC-DiT)
+            self.q_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+            self.k_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
             with torch.no_grad():
-                self.in_proj.weight.copy_(torch.eye(d_model))
-            self.in_proj.weight._no_reinit = True
-            
-            # 3x3 depthwise conv for spatial similarity
-            self.spatial_conv = nn.Conv2d(
-                d_model, d_model, kernel_size=3, padding=1,
-                groups=d_model, bias=False, **factory_kwargs
-            )
-            with torch.no_grad():
-                kernel = torch.tensor([
-                    [1/9, 1/9, 1/9],
-                    [1/9, 1/9, 1/9],
-                    [1/9, 1/9, 1/9]
-                ])
-                self.spatial_conv.weight.data.copy_(
-                    kernel.view(1, 1, 3, 3).expand(d_model, 1, 3, 3)
+                self.q_proj.weight.copy_(torch.eye(d_model))
+                self.k_proj.weight.copy_(torch.eye(d_model))
+            self.q_proj.weight._no_reinit = True
+            self.k_proj.weight._no_reinit = True
+
+            if routing_type == "spatial":
+                K = spatial_kernel_size
+                self.spatial_conv = nn.Conv2d(
+                    d_model, d_model, kernel_size=K, padding=K // 2,
+                    groups=d_model, bias=False, **factory_kwargs
                 )
-            self.spatial_conv.weight._no_reinit = True
-            
-        elif routing_type in ("spatial_3d", "spatial_3d_causal"):
-            # 3D spatial-temporal routing (for video); causal variant reuses these layers
-            self.in_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
-            with torch.no_grad():
-                self.in_proj.weight.copy_(torch.eye(d_model))
-            self.in_proj.weight._no_reinit = True
-            
-            # 3x3x3 depthwise conv for spatio-temporal similarity
-            self.spatio_temp_conv = nn.Conv3d(
-                d_model, d_model, kernel_size=3, padding=1,
-                groups=d_model, bias=False, **factory_kwargs
-            )
-            with torch.no_grad():
-                kernel = torch.ones(3, 3, 3) / 27.0
-                self.spatio_temp_conv.weight.data.copy_(
-                    kernel.view(1, 1, 3, 3, 3).expand(d_model, 1, 3, 3, 3)
+                with torch.no_grad():
+                    kernel = torch.ones(K, K) / (K * K - 1)
+                    kernel[K // 2, K // 2] = 0
+                    self.spatial_conv.weight.data.copy_(
+                        kernel.view(1, 1, K, K).expand(d_model, 1, K, K)
+                    )
+                self.spatial_conv.weight._no_reinit = True
+            else:  # spatial_3d
+                K = spatial_kernel_size
+                self.spatial_conv_3d = nn.Conv3d(
+                    d_model, d_model, kernel_size=K, padding=K // 2,
+                    groups=d_model, bias=False, **factory_kwargs
                 )
-            self.spatio_temp_conv.weight._no_reinit = True
-            
+                with torch.no_grad():
+                    kernel = torch.ones(K, K, K) / (K * K * K - 1)
+                    kernel[K // 2, K // 2, K // 2] = 0
+                    self.spatial_conv_3d.weight.data.copy_(
+                        kernel.view(1, 1, K, K, K).expand(d_model, 1, K, K, K)
+                    )
+                self.spatial_conv_3d.weight._no_reinit = True
+
         elif routing_type == "temporal":
-            # Temporal-only routing
             self.in_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
             with torch.no_grad():
                 self.in_proj.weight.copy_(torch.eye(d_model))
@@ -138,64 +132,39 @@ class RoutingModule(nn.Module):
             self.k_proj_layer.weight._no_reinit = True
 
     def _compute_spatial_boundary(self, hidden_states, num_rows, num_cols):
-        """Compute boundary scores using 2D spatial convolution."""
+        """Compute boundary scores as Q-K cosine similarity to spatial neighbors (DC-DiT style)."""
         B, L, D = hidden_states.shape
-        x = F.normalize(self.in_proj(hidden_states), dim=-1)
-        x = x.transpose(1, 2).reshape(B, D, num_rows, num_cols)
-        diff = self.spatial_conv(x)  # (B, D, H, W)
-        boundary_score = diff.mean(dim=1)  # (B, H, W)
-        boundary_score = boundary_score.view(B, L)  # (B, L)
-        return boundary_score
+        q = F.normalize(self.q_proj(hidden_states), dim=-1)
+        k = F.normalize(self.k_proj(hidden_states), dim=-1)
+        q = q.transpose(1, 2).reshape(B, D, num_rows, num_cols)
+        k = k.transpose(1, 2).reshape(B, D, num_rows, num_cols)
+        k_avg = self.spatial_conv(k)  # (B, D, H, W) — neighbor average (center excluded)
+        sim_score = (q * k_avg).sum(dim=1)  # (B, H, W) — cosine similarity
+        return sim_score.view(B, L)
     
     def _compute_spatial_3d_boundary(self, hidden_states, num_frames, num_rows, num_cols):
-        """Compute boundary scores using 3D spatio-temporal convolution."""
+        """Compute boundary scores as Q-K cosine similarity to 3D neighbors (DC-DiT extended to video)."""
         B, L, D = hidden_states.shape
-        x = F.normalize(self.in_proj(hidden_states), dim=-1)
-        x = x.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
-        diff = self.spatio_temp_conv(x)  # (B, D, T, H, W)
-        boundary_score = diff.mean(dim=1)  # (B, T, H, W)
-        boundary_score = boundary_score.view(B, L)  # (B, L)
-        return boundary_score
-    
-    def _compute_spatial_3d_causal_boundary(self, hidden_states, num_frames, num_rows, num_cols):
-        """Same as _compute_spatial_3d_boundary but causal temporal padding (past-only on T)."""
-        B, L, D = hidden_states.shape
-        x = F.normalize(self.in_proj(hidden_states), dim=-1)
-        x = x.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
-        # F.pad last dims: (W_left, W_right, H_left, H_right, T_left, T_right)
-        x = F.pad(x, (1, 1, 1, 1, 2, 0))
-        diff = F.conv3d(
-            x,
-            self.spatio_temp_conv.weight,
-            None,
-            stride=1,
-            padding=0,
-            dilation=1,
-            groups=D,
-        )
-        boundary_score = diff.mean(dim=1)  # (B, T, H, W)
-        boundary_score = boundary_score.view(B, L)  # (B, L)
-        return boundary_score
+        q = F.normalize(self.q_proj(hidden_states), dim=-1)
+        k = F.normalize(self.k_proj(hidden_states), dim=-1)
+        q = q.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
+        k = k.transpose(1, 2).reshape(B, D, num_frames, num_rows, num_cols)
+        k_avg = self.spatial_conv_3d(k)  # (B, D, T, H, W) — neighbor average (center excluded)
+        sim_score = (q * k_avg).sum(dim=1)  # (B, T, H, W) — cosine similarity
+        return sim_score.view(B, L)
     
     def _compute_temporal_boundary(self, hidden_states, num_frames, tokens_per_frame):
-        """Compute boundary scores using temporal convolution.
-        
-        For video, we compute boundary scores per-frame by averaging over spatial tokens,
-        then apply temporal convolution to find temporal boundaries.
-        """
+        """Compute boundary scores using temporal convolution."""
         B, L, D = hidden_states.shape
         x = F.normalize(self.in_proj(hidden_states), dim=-1)
         
-        # Reshape to (B, T, H*W, D) and average over spatial dimension
         x = x.view(B, num_frames, tokens_per_frame, D)
         x_temporal = x.mean(dim=2)  # (B, T, D)
         
-        # Apply temporal convolution
         x_temporal = x_temporal.transpose(1, 2)  # (B, D, T)
         diff = self.temporal_conv(x_temporal)  # (B, D, T)
         boundary_score_per_frame = diff.mean(dim=1)  # (B, T)
         
-        # Expand to all tokens in each frame
         boundary_score = boundary_score_per_frame.unsqueeze(-1).expand(-1, -1, tokens_per_frame)
         boundary_score = boundary_score.reshape(B, L)
         
@@ -231,20 +200,13 @@ class RoutingModule(nn.Module):
                 "num_frames, num_rows and num_cols required for spatial_3d routing"
             sim_score = self._compute_spatial_3d_boundary(hidden_states, num_frames, num_rows, num_cols)
             
-        elif self.routing_type == "spatial_3d_causal":
-            assert num_frames is not None and num_rows is not None and num_cols is not None, \
-                "num_frames, num_rows and num_cols required for spatial_3d_causal routing"
-            sim_score = self._compute_spatial_3d_causal_boundary(
-                hidden_states, num_frames, num_rows, num_cols
-            )
-            
         elif self.routing_type == "temporal":
             assert num_frames is not None, "num_frames required for temporal routing"
             tokens_per_frame = hidden_states.shape[1] // num_frames
             sim_score = self._compute_temporal_boundary(hidden_states, num_frames, tokens_per_frame)
             
         else:
-            # Q-K based routing
+            # Q-K based routing (bidirectional or causal)
             sim_score = torch.einsum(
                 "b l d, b l d -> b l",
                 F.normalize(self.q_proj_layer(hidden_states[:, :-1]), dim=-1),
@@ -254,17 +216,14 @@ class RoutingModule(nn.Module):
             if self.routing_type == "bidirectional":
                 sim_score = (sim_score[:, :-1] + sim_score[:, 1:]) / 2  # Shape: (B, L-2)
 
-        # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - sim_score) / 2), min=0.0, max=1.0)
 
         PAD_PROB = 1.0
         if self.routing_type == "bidirectional":
-            # Bidirectional: force first and last tokens to 1.0
             boundary_prob = F.pad(boundary_prob, (1, 1), "constant", PAD_PROB)
         elif self.routing_type == "causal":
-            # Causal: force only first token to 1.0
             boundary_prob = F.pad(boundary_prob, (1, 0), "constant", PAD_PROB)
-        elif self.routing_type in ("spatial", "spatial_3d", "temporal", "spatial_3d_causal"):
+        elif self.routing_type in ("spatial", "spatial_3d", "temporal"):
             boundary_prob[:, 0] = PAD_PROB
             boundary_prob[:, -1] = PAD_PROB
 
@@ -272,9 +231,8 @@ class RoutingModule(nn.Module):
 
         selected_idx = torch.argmax(boundary_prob, dim=-1)
 
-        boundary_mask = selected_idx == 1  # (shape hidden_states.shape[:-1])
+        boundary_mask = selected_idx == 1
         if mask is not None:
-            # No invalid tokens can be selected
             boundary_mask = boundary_mask & mask
 
         selected_probs = boundary_prob.gather(

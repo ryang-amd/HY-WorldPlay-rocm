@@ -524,16 +524,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
             # Optional dynamic-chunking regularizers.
             training_batch.dc_ratio_loss_val = 0.0
-            training_batch.dc_temporal_loss_val = 0.0
             if getattr(self.transformer, "dc_enabled", False):
                 if hasattr(self.transformer, "get_ratio_loss"):
                     rl = self.transformer.get_ratio_loss()
                     training_batch.dc_ratio_loss_val = rl.detach().item()
                     loss = loss + rl / self.training_args.gradient_accumulation_steps
-                if hasattr(self.transformer, "get_temporal_boundary_loss"):
-                    tl = self.transformer.get_temporal_boundary_loss()
-                    training_batch.dc_temporal_loss_val = tl.detach().item()
-                    loss = loss + tl / self.training_args.gradient_accumulation_steps
 
             loss.backward()
             torch.cuda.empty_cache()
@@ -726,17 +721,25 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 }
                 if getattr(self.transformer, "dc_enabled", False):
                     log_dict["dc/ratio_loss"] = getattr(training_batch, "dc_ratio_loss_val", 0.0)
-                    log_dict["dc/temporal_boundary_loss"] = getattr(training_batch, "dc_temporal_loss_val", 0.0)
                     ro = getattr(self.transformer, "last_routing_output", None)
                     if ro is not None:
                         log_dict["dc/actual_boundary_ratio"] = ro.boundary_mask.float().mean().item()
                         log_dict["dc/avg_boundary_prob"] = ro.boundary_prob[..., 1].float().mean().item()
-                    dc_mod = getattr(self.transformer, "dc_module", None)
-                    if dc_mod is not None:
-                        tp = getattr(dc_mod, "last_temporal_boundary_prob", None)
-                        if tp is not None:
-                            log_dict["dc/temporal_avg_prob"] = tp.float().mean().item()
                     log_dict["dc/dc_lr"] = self.optimizer.param_groups[-1]["lr"] if len(self.optimizer.param_groups) > 1 else 0.0
+                    dc_stats = getattr(self.transformer, "_dc_stats", None)
+                    if dc_stats:
+                        log_dict["dc/chunk_len"] = dc_stats["chunk_len"]
+                        log_dict["dc/total_tokens"] = dc_stats["total_tokens"]
+                        log_dict["dc/tokens_per_frame_mean"] = dc_stats["tokens_per_frame_mean"]
+                        log_dict["dc/tokens_per_frame_std"] = dc_stats["tokens_per_frame_std"]
+                        log_dict["dc/tokens_per_frame_min"] = dc_stats["tokens_per_frame_min"]
+                        log_dict["dc/tokens_per_frame_max"] = dc_stats["tokens_per_frame_max"]
+                        log_dict["dc/prob_selected_mean"] = dc_stats["prob_of_selected"]
+                        log_dict["dc/prob_rejected_mean"] = dc_stats["prob_of_rejected"]
+                    loss_parts = getattr(self.transformer, "_ratio_loss_components", None)
+                    if loss_parts:
+                        log_dict["dc/switch_loss"] = loss_parts["switch_loss"]
+                        log_dict["dc/sharpening_loss"] = loss_parts["sharpening_loss"]
                 wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:
