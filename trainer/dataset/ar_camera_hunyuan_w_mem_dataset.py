@@ -180,6 +180,7 @@ def calculate_fov_overlap_similarity(
     fov_half_v = torch.tensor(fov_v_deg / 2.0, device=device)
 
     # move to P_w_curr (N, 3)
+    points_local = points_local.to(device=device, non_blocking=True)
     points_world = points_local + P_w_curr[None, :]
 
     in_fov_curr = is_inside_fov_3d_hv(
@@ -400,7 +401,7 @@ class CameraJsonWMemDataset(Dataset):
             (0, 1, 0, 1): 8,
         }
 
-        self.points_local = generate_points_in_sphere(50000, 8.0).to(device)
+        self.points_local = generate_points_in_sphere(50000, 8.0)
 
         neg_prompt_path = os.environ.get(
             "HUNYUAN_NEG_PROMPT_PATH", "/your_path/to/hunyuan_neg_prompt.pt")
