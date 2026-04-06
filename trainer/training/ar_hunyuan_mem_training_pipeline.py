@@ -739,7 +739,6 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     loss_parts = getattr(self.transformer, "_ratio_loss_components", None)
                     if loss_parts:
                         log_dict["dc/switch_loss"] = loss_parts["switch_loss"]
-                        log_dict["dc/sharpening_loss"] = loss_parts["sharpening_loss"]
                 wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:

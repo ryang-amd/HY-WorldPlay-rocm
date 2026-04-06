@@ -108,16 +108,15 @@ class DynamicChunkingModule(nn.Module):
             causal_smooth=config.causal_smooth,
         )
 
-        # Small-identity init for residual projection: 0.1 * I.
-        # Gives a 10% skip connection from the start so the model doesn't need
-        # to learn the skip from scratch, while keeping the DC path dominant
-        # (90% signal) to maintain strong routing gradients.
+        # Zero-init residual projection (matching DC-DiT).
+        # At init residual=0 so output=dechunked, forcing the model to learn
+        # through the DC path from step 0.  This gives strong gradients to the
+        # routing module.
         self.residual_proj = nn.Linear(
             hidden_size, hidden_size, device=device, dtype=torch.float32
         )
-        with torch.no_grad():
-            self.residual_proj.weight.copy_(0.1 * torch.eye(hidden_size))
-            self.residual_proj.bias.zero_()
+        nn.init.zeros_(self.residual_proj.weight)
+        nn.init.zeros_(self.residual_proj.bias)
         self.residual_proj.weight._no_reinit = True
 
         self.use_ste = config.use_ste
@@ -427,14 +426,11 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             self.last_routing_output = None
     
     def get_ratio_loss(self) -> torch.Tensor:
-        """Switch-Transformer load-balancing loss + sharpening loss.
+        """Switch-Transformer-style load-balancing loss (matching DC-DiT).
 
-        The switch loss couples hard selection rate (true_ratio) with soft
-        probability (avg_prob), pushing both toward 1/N.  When N=2 the switch
-        loss minimum coincides with the uniform initialization (prob=0.5),
-        giving no learning signal.  The sharpening term (negative entropy)
-        penalizes indecisive probabilities, forcing confident 0-or-1 decisions
-        regardless of N.
+        Couples the hard boundary selection rate (true_ratio) with the soft
+        predicted probability (avg_prob).  Minimized when both converge to
+        1/N, where N is the target downsample factor.
         """
         model_device = next(self.parameters()).device
         if self.last_routing_output is None:
@@ -447,25 +443,16 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
         avg_prob = boundary_prob[..., 1].float().mean()
         true_ratio = boundary_mask.float().mean()
 
-        switch_loss = (
+        loss = (
             (1.0 - true_ratio) * (1.0 - avg_prob)
             + true_ratio * avg_prob * (N - 1)
         ) * N / (N - 1)
 
-        # Sharpening: minimize entropy of boundary_prob distribution.
-        # Entropy is maximized at uniform (0.5, 0.5) and minimized at (0, 1)
-        # or (1, 0).  Clamping avoids log(0).
-        p = boundary_prob.float().clamp(1e-6, 1.0 - 1e-6)
-        entropy = -(p * p.log()).sum(dim=-1).mean()
-        sharpening_loss = entropy
-
         self._ratio_loss_components = {
-            "switch_loss": switch_loss.item(),
-            "sharpening_loss": sharpening_loss.item(),
-            "entropy": entropy.item(),
+            "switch_loss": loss.item(),
         }
 
-        return (switch_loss + sharpening_loss) * self.dc_ratio_loss_weight
+        return loss * self.dc_ratio_loss_weight
 
     def forward(
         self,
