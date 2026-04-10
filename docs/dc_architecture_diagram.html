@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DC-HunyuanWorldPlay Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f8f9fa; padding: 40px 20px; }
+  .diagram { max-width: 1100px; margin: 0 auto; }
+  h1 { text-align: center; font-size: 22px; color: #1a1a2e; margin-bottom: 6px; }
+  .subtitle { text-align: center; font-size: 13px; color: #666; margin-bottom: 30px; }
+
+  a.code-link {
+    display: inline-block; margin-top: 4px; font-size: 10px; color: #1565c0;
+    text-decoration: none; background: #e3f2fd; padding: 1px 6px; border-radius: 3px;
+    font-family: 'Consolas', 'Monaco', monospace; border: 1px solid #90caf9;
+    cursor: pointer;
+  }
+  a.code-link:hover { background: #bbdefb; text-decoration: underline; }
+  a.code-link::before { content: '↗ '; font-size: 9px; }
+
+  .pipeline { display: flex; flex-direction: column; gap: 0; align-items: center; }
+
+  .box {
+    border: 2px solid #333;
+    border-radius: 10px;
+    padding: 14px 20px;
+    text-align: center;
+    font-size: 13px;
+    position: relative;
+    min-width: 220px;
+  }
+  .box .label { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .box .detail { color: #555; font-size: 11.5px; line-height: 1.5; }
+
+  .input-box  { background: #e8f5e9; border-color: #43a047; }
+  .phase-box  { background: #e3f2fd; border-color: #1976d2; }
+  .dc-box     { background: #fff3e0; border-color: #e65100; }
+  .dc-inner   { background: #fff8e1; border-color: #f9a825; border-style: dashed; }
+  .output-box { background: #f3e5f5; border-color: #7b1fa2; }
+  .loss-box   { background: #fce4ec; border-color: #c62828; border-style: dashed; }
+
+  .arrow {
+    width: 2px; height: 28px; background: #333; position: relative; margin: 0 auto;
+  }
+  .arrow::after {
+    content: ''; position: absolute; bottom: -1px; left: 50%; transform: translateX(-50%);
+    border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-top: 8px solid #333;
+  }
+  .arrow-label {
+    font-size: 10.5px; color: #666; position: absolute; left: 14px; top: 4px; white-space: nowrap;
+  }
+
+  .dc-container {
+    border: 3px solid #e65100; border-radius: 14px; padding: 20px 24px;
+    background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+    width: 100%; max-width: 900px; position: relative;
+  }
+  .dc-container .dc-title {
+    position: absolute; top: -13px; left: 24px;
+    background: #e65100; color: #fff; padding: 2px 14px; border-radius: 6px;
+    font-weight: 700; font-size: 13px;
+  }
+  .dc-inner-flow { display: flex; flex-direction: column; align-items: center; gap: 0; }
+
+  .side-by-side {
+    display: flex; gap: 30px; align-items: flex-start; justify-content: center;
+    width: 100%;
+  }
+  .side-col { display: flex; flex-direction: column; align-items: center; gap: 0; flex: 1; }
+
+  .residual-wrap { position: relative; width: 100%; display: flex; justify-content: center; }
+  .residual-line {
+    position: absolute; right: -60px; top: -180px; width: 50px; height: 220px;
+    border: 2px dashed #c62828; border-left: none; border-radius: 0 12px 12px 0;
+  }
+  .residual-line::after {
+    content: ''; position: absolute; bottom: -1px; left: -5px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 7px solid #c62828;
+  }
+  .residual-label {
+    position: absolute; right: -110px; top: -80px; font-size: 10px; color: #c62828;
+    writing-mode: vertical-lr; transform: rotate(180deg);
+  }
+
+  .horiz-flow { display: flex; align-items: center; gap: 8px; }
+  .horiz-arrow {
+    width: 30px; height: 2px; background: #333; position: relative;
+  }
+  .horiz-arrow::after {
+    content: ''; position: absolute; right: -1px; top: 50%; transform: translateY(-50%);
+    border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+    border-left: 7px solid #333;
+  }
+
+  .add-circle {
+    width: 32px; height: 32px; border-radius: 50%; border: 2px solid #333;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: bold; background: #fff; flex-shrink: 0;
+  }
+
+  .dim-tag {
+    display: inline-block; background: #e0e0e0; border-radius: 4px;
+    padding: 1px 6px; font-size: 10px; color: #333; margin-top: 3px;
+  }
+
+  .legend {
+    display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;
+    margin-top: 28px; font-size: 11.5px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-swatch {
+    width: 16px; height: 16px; border-radius: 3px; border: 1.5px solid #333;
+  }
+</style>
+</head>
+<body>
+<div class="diagram">
+  <h1>Dynamic Chunking (DC) integrated into HunyuanWorldPlay Transformer</h1>
+  <p class="subtitle">
+    <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L295">ARHunyuanVideo_1_5_DC_DiffusionTransformer</a>
+    &mdash; 54 double-stream blocks, DC active on blocks 10&ndash;44
+  </p>
+
+  <div class="pipeline">
+
+    <!-- Inputs -->
+    <div class="box input-box" style="min-width:500px;">
+      <div class="label">Inputs</div>
+      <div class="detail">
+        Noisy latent <b>x</b> &nbsp;|&nbsp; Text embeddings <b>txt</b> &nbsp;|&nbsp; Timestep <b>t</b> &nbsp;|&nbsp; Camera pose / action &nbsp;|&nbsp; Reference image
+        <br><span class="dim-tag">x: (B, 32, T, H, W)</span>
+      </div>
+    </div>
+
+    <div class="arrow"><span class="arrow-label">Patch embed + RoPE + text refiner</span></div>
+
+    <div class="box input-box" style="min-width:400px;">
+      <div class="label">Token Preparation</div>
+      <div class="detail">
+        <b>img_in</b>: patch embed &rarr; <b>img</b> tokens <span class="dim-tag">(B, T&times;H&times;W, 2048)</span><br>
+        <b>txt_in</b>: text refiner &rarr; <b>txt</b> tokens<br>
+        <b>time_in</b> + <b>action_in</b>: modulation vector <b>vec</b>
+      </div>
+    </div>
+
+    <div class="arrow"><span class="arrow-label">img, txt, vec</span></div>
+
+    <!-- Phase 1 -->
+    <div class="box phase-box" style="min-width:500px;">
+      <div class="label">Phase 1: Full-Resolution Double-Stream Blocks</div>
+      <div class="detail">
+        Blocks 0&ndash;9 &nbsp;(10 blocks)<br>
+        Full attention with ProPE + causal masking<br>
+        Each block: <b>img &harr; txt</b> cross-attention + self-attention + FFN
+        <br><span class="dim-tag">img: (B, L, 2048) where L = T&times;H&times;W</span>
+        <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L622">ar_action_dc_...transformer.py:622</a>
+      </div>
+    </div>
+
+    <div class="arrow"><span class="arrow-label">img at full resolution (L tokens)</span></div>
+
+    <!-- DC Container -->
+    <div class="dc-container">
+      <span class="dc-title"><a href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L63" style="color:#fff; text-decoration:none;">Dynamic Chunking Module</a></span>
+      <div class="dc-inner-flow">
+
+        <!-- Routing -->
+        <div style="display:flex; gap:20px; align-items:flex-start; width:100%; justify-content:center; margin-top:10px;">
+          <div class="box dc-inner" style="flex:1; max-width:380px;">
+            <div class="label">Routing Module</div>
+            <div class="detail">
+              Q-K cosine similarity with 3D grouped conv<br>
+              <b>q</b> = normalize(Q_proj(img))<br>
+              <b>k_avg</b> = Conv3D_neighbors(K_proj(img))<br>
+              sim = &langle;q, k_avg&rangle; &rarr; boundary_prob &rarr; top-1/N selection<br>
+              <span class="dim-tag">boundary_mask: (B, L) &mdash; which tokens to keep</span>
+              <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L41">RoutingModule (dc.py:41)</a>
+              <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L145">_compute_spatial_3d_boundary (dc.py:145)</a>
+            </div>
+          </div>
+          <div class="box dc-inner" style="flex:1; max-width:280px;">
+            <div class="label">Residual Projection</div>
+            <div class="detail">
+              <b>residual</b> = Linear(img)<br>
+              Zero-initialized at training start<br>
+              &rarr; output starts as pure dechunked,<br>
+              learns correction over training
+              <br><span class="dim-tag">residual: (B, L, 2048)</span>
+              <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L115">residual_proj (L115-120)</a>
+              <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L160">forward (L160-161)</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="arrow"><span class="arrow-label">boundary_mask selects L/4 tokens</span></div>
+
+        <!-- Chunk -->
+        <div class="box dc-box" style="min-width:350px;">
+          <div class="label">Chunk Layer</div>
+          <div class="detail">
+            Gather boundary tokens by selected_indices<br>
+            Also gather: RoPE freqs, modulation vec, viewmats<br>
+            <span class="dim-tag">img: (B, L, 2048) &rarr; chunked_img: (B, L/4, 2048)</span>
+            <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L249">ChunkLayer (dc.py:249)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L183">chunk() (L183)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L644">called at (L644-679)</a>
+          </div>
+        </div>
+
+        <div class="arrow"><span class="arrow-label">chunked_img (L/4 tokens, 4x shorter)</span></div>
+
+        <!-- Phase 2 -->
+        <div class="box phase-box" style="min-width:500px; border-color:#e65100;">
+          <div class="label">Phase 2: Chunked Double-Stream Blocks</div>
+          <div class="detail">
+            Blocks 10&ndash;43 &nbsp;(34 blocks)<br>
+            Same architecture as Phase 1, but operating on <b>4x fewer tokens</b><br>
+            Causal attention with chunk-aware offsets<br>
+            <span class="dim-tag">chunked_img: (B, L/4, 2048) &mdash; ~4x compute savings per block</span>
+            <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L697">Phase 2 loop (L697-718)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L681">chunk-causal offsets (L681-695)</a>
+          </div>
+        </div>
+
+        <div class="arrow"><span class="arrow-label">chunked_img after 34 blocks</span></div>
+
+        <!-- Dechunk -->
+        <div class="box dc-box" style="min-width:440px;">
+          <div class="label">DeChunk Layer</div>
+          <div class="detail">
+            Scatter chunked tokens back to original positions<br>
+            <b>Nearest-3D plug-back</b> fills non-boundary positions<br>
+            <b>Spatial kernel smoothing</b> blends boundaries<br>
+            <b>+ Residual</b>: output = STE(prob) &times; dechunked + residual<br>
+            <span class="dim-tag">chunked_img: (B, L/4, 2048) &rarr; img: (B, L, 2048)</span>
+            <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L553">DeChunkLayer (dc.py:553)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L850">plug_back nearest_3d (dc.py:850)</a>
+            <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L643">_smooth_spatial_kernel (dc.py:643)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L211">dechunk() (L211)</a>
+            <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L720">called at (L720-724)</a>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="arrow"><span class="arrow-label">img restored to full resolution (L tokens)</span></div>
+
+    <!-- Phase 3 -->
+    <div class="box phase-box" style="min-width:500px;">
+      <div class="label">Phase 3: Full-Resolution Double-Stream Blocks</div>
+      <div class="detail">
+        Blocks 44&ndash;53 &nbsp;(10 blocks)<br>
+        Full attention &mdash; refines details after DC reconstruction<br>
+        <span class="dim-tag">img: (B, L, 2048)</span>
+        <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L726">Phase 3 loop (L726-740)</a>
+      </div>
+    </div>
+
+    <div class="arrow"><span class="arrow-label">img, txt</span></div>
+
+    <!-- Output -->
+    <div class="box output-box" style="min-width:400px;">
+      <div class="label">Output Projection + VAE Decode</div>
+      <div class="detail">
+        <b>final_layer</b>: (B, L, 2048) &rarr; (B, L, patch_dim)<br>
+        Unpatchify &rarr; predicted noise <b>&epsilon;</b><br>
+        VAE decoder &rarr; video frames
+        <br><span class="dim-tag">output: (B, C, T, H, W)</span>
+      </div>
+    </div>
+
+    <div class="arrow"></div>
+
+    <!-- Loss -->
+    <div style="display:flex; gap:20px; justify-content:center;">
+      <div class="box loss-box" style="min-width:200px;">
+        <div class="label">Diffusion Loss</div>
+        <div class="detail">
+          MSE(&epsilon;_pred, &epsilon;_true)
+          <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/training/ar_hunyuan_mem_training_pipeline.py#L574">pipeline.py:574</a>
+        </div>
+      </div>
+      <div class="box loss-box" style="min-width:260px;">
+        <div class="label">DC Switch Loss</div>
+        <div class="detail">
+          Load-balancing regularizer<br>
+          Pushes boundary ratio &rarr; 1/N<br>
+          Weighted by <b>dc_ratio_loss_weight</b>
+          <br><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L432">get_ratio_loss() (L432-459)</a>
+          <a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/training/ar_hunyuan_mem_training_pipeline.py#L577">added to loss (pipeline.py:577-582)</a>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Legend -->
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:#e8f5e9; border-color:#43a047;"></div> Input/Embedding</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#e3f2fd; border-color:#1976d2;"></div> Transformer Blocks</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#fff3e0; border-color:#e65100;"></div> DC Module (added)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#fff8e1; border-color:#f9a825; border-style:dashed;"></div> DC Sub-components</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#f3e5f5; border-color:#7b1fa2;"></div> Output</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#fce4ec; border-color:#c62828; border-style:dashed;"></div> Loss Functions</div>
+  </div>
+
+  <!-- Summary table -->
+  <div style="margin-top: 32px; max-width: 700px; margin-left: auto; margin-right: auto;">
+    <table style="width:100%; border-collapse:collapse; font-size:12.5px;">
+      <tr style="background:#e65100; color:#fff;">
+        <th style="padding:6px 10px; text-align:left;">Component</th>
+        <th style="padding:6px 10px; text-align:left;">Added by DC</th>
+        <th style="padding:6px 10px; text-align:left;">Params</th>
+        <th style="padding:6px 10px; text-align:left;">Source</th>
+      </tr>
+      <tr style="background:#fff8e1;">
+        <td style="padding:5px 10px;">RoutingModule</td>
+        <td style="padding:5px 10px;">Q_proj, K_proj (identity init), Conv3D (neighbor avg)</td>
+        <td style="padding:5px 10px;">~8.4M</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L41">dc.py:41</a></td>
+      </tr>
+      <tr style="background:#fff;">
+        <td style="padding:5px 10px;">ChunkLayer</td>
+        <td style="padding:5px 10px;">Index gather (no learned params)</td>
+        <td style="padding:5px 10px;">0</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L249">dc.py:249</a></td>
+      </tr>
+      <tr style="background:#fff8e1;">
+        <td style="padding:5px 10px;">DeChunkLayer</td>
+        <td style="padding:5px 10px;">Nearest-3D plug-back + spatial kernel smoothing</td>
+        <td style="padding:5px 10px;">~0.1M</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/dc.py#L553">dc.py:553</a></td>
+      </tr>
+      <tr style="background:#fff;">
+        <td style="padding:5px 10px;">Residual Projection</td>
+        <td style="padding:5px 10px;">Linear (2048&rarr;2048), zero-init</td>
+        <td style="padding:5px 10px;">~4.2M</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L115">transformer.py:115</a></td>
+      </tr>
+      <tr style="background:#fff8e1;">
+        <td style="padding:5px 10px;">DynamicChunkingModule</td>
+        <td style="padding:5px 10px;">Orchestrates routing &rarr; chunk &rarr; dechunk</td>
+        <td style="padding:5px 10px;">&mdash;</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L63">transformer.py:63</a></td>
+      </tr>
+      <tr style="background:#fff;">
+        <td style="padding:5px 10px;">DC Switch Loss</td>
+        <td style="padding:5px 10px;">Load-balancing ratio loss</td>
+        <td style="padding:5px 10px;">0</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L432">transformer.py:432</a></td>
+      </tr>
+      <tr style="background:#fff8e1;">
+        <td style="padding:5px 10px;">DC Config</td>
+        <td style="padding:5px 10px;">Dataclass with all DC hyperparameters</td>
+        <td style="padding:5px 10px;">&mdash;</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/modules/dynamic_chunking/config.py">config.py</a></td>
+      </tr>
+      <tr style="background:#e3f2fd;">
+        <td style="padding:5px 10px; font-weight:600;">Base Transformer</td>
+        <td style="padding:5px 10px;">54 double-stream blocks (unchanged)</td>
+        <td style="padding:5px 10px;">~3B</td>
+        <td style="padding:5px 10px;"><a class="code-link" href="https://github.com/ryang-amd/HY-WorldPlay-rocm/blob/dc_v2/trainer/models/hyvideo/models/transformers/ar_action_dc_hunyuanvideo_1_5_transformer.py#L295">transformer.py:295</a></td>
+      </tr>
+    </table>
+  </div>
+
+</div>
+</body>
+</html>
