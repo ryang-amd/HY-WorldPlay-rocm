@@ -425,6 +425,10 @@ class ARHunyuanVideo_1_5_DC_DiffusionTransformer(ARHunyuanVideo_1_5_DiffusionTra
             self.dc_module = None
             self.last_routing_output = None
     
+    def set_dc_downsample_factor(self, factor: float):
+        """Update the target downsample factor used by the Switch loss."""
+        self.dc_downsample_factor = factor
+
     def get_ratio_loss(self) -> torch.Tensor:
         """Switch-Transformer-style load-balancing loss (matching DC-DiT).
 

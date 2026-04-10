@@ -56,6 +56,42 @@ vsa_available = is_vsa_available()
 logger = init_logger(__name__)
 
 
+class EMATracker:
+    """Exponential Moving Average of model parameters.
+
+    Shadow copies live on CPU in bf16 to minimize GPU->CPU transfer cost.
+    Update is called every ``update_every`` steps to amortize the overhead.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.data.detach().cpu().contiguous().clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for n, p in model.named_parameters():
+            if n in self.shadow:
+                self.shadow[n].lerp_(p.data.detach().cpu().contiguous(), 1.0 - self.decay)
+
+    def apply(self, model: torch.nn.Module):
+        """Swap model weights with EMA shadow (for inference)."""
+        self.backup: dict[str, torch.Tensor] = {}
+        for n, p in model.named_parameters():
+            if n in self.shadow:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+
+    def restore(self, model: torch.nn.Module):
+        """Restore original model weights after EMA inference."""
+        for n, p in model.named_parameters():
+            if n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = {}
+
+
 def _get_trainable_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -184,6 +220,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         ]
 
         self.init_steps = 0
+        self._skipped_steps = 0
         logger.info("optimizer: %s", self.optimizer)
 
         self.lr_scheduler = get_scheduler(
@@ -196,6 +233,20 @@ class TrainingPipeline(LoRAPipeline, ABC):
             min_lr_ratio=training_args.min_lr_ratio,
             last_epoch=self.init_steps - 1,
         )
+
+        if training_args.use_ema:
+            self.ema = EMATracker(self.transformer, decay=training_args.ema_decay)
+            self.ema_start_step = training_args.ema_start_step
+            logger.info("EMA enabled: decay=%.6f, start_step=%d, tracking %d params",
+                        training_args.ema_decay, training_args.ema_start_step,
+                        len(self.ema.shadow))
+        else:
+            self.ema = None
+            self.ema_start_step = 0
+
+        self.dc_warmup_steps = training_args.dc_warmup_steps
+        self.dc_warmup_start_factor = training_args.dc_warmup_start_factor
+        self.dc_warmup_end_factor = getattr(self.transformer, "dc_downsample_factor", 4.0)
 
         self.train_dataset, self.train_dataloader = build_ar_camera_hunyuan_w_mem_dataloader(
             json_path=training_args.json_path,
@@ -598,13 +649,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
         dist.all_reduce(grad_norm, op=dist.ReduceOp.MAX)
         training_batch.grad_norm = grad_norm.item()
 
-        dc_active = getattr(self.transformer, "dc_enabled", False)
-        grad_norm_limit = 100.0 if dc_active else 10.0
         grad_is_valid = (
             not math.isnan(training_batch.grad_norm)
             and not math.isinf(training_batch.grad_norm)
-            and training_batch.grad_norm < grad_norm_limit
         )
+
+        if not grad_is_valid:
+            self._skipped_steps += 1
 
         if self.global_rank == 0 and not grad_is_valid:
             logger.warning(
@@ -619,6 +670,20 @@ class TrainingPipeline(LoRAPipeline, ABC):
         training_batch.total_loss = training_batch.total_loss
         training_batch.grad_norm = training_batch.grad_norm
         return training_batch
+
+    def _save_ema_checkpoint(self, step: int) -> None:
+        if not self.ema or self.global_rank != 0:
+            return
+        save_dir = os.path.join(
+            self.training_args.output_dir, f"checkpoint-{step}", "transformer")
+        os.makedirs(save_dir, exist_ok=True)
+        ema_path = os.path.join(save_dir, "ema_diffusion_pytorch_model.pt")
+        ema_state = {
+            k: v.detach().to(torch.bfloat16).cpu().contiguous().clone()
+            for k, v in self.ema.shadow.items()
+        }
+        torch.save(ema_state, ema_path)
+        logger.info("EMA checkpoint saved to %s", ema_path)
 
     def _resume_from_checkpoint(self) -> None:
         logger.info("Loading checkpoint from %s",
@@ -692,10 +757,23 @@ class TrainingPipeline(LoRAPipeline, ABC):
             else:
                 current_vsa_sparsity = 0.0
 
+            if (self.dc_warmup_steps > 0
+                    and hasattr(self.transformer, 'set_dc_downsample_factor')):
+                if step < self.dc_warmup_steps:
+                    t = step / self.dc_warmup_steps
+                    factor = (self.dc_warmup_start_factor
+                              + (self.dc_warmup_end_factor - self.dc_warmup_start_factor) * t)
+                else:
+                    factor = self.dc_warmup_end_factor
+                self.transformer.set_dc_downsample_factor(factor)
+
             training_batch = TrainingBatch()
             training_batch.current_timestep = step
             training_batch.current_vsa_sparsity = current_vsa_sparsity
             training_batch = self.train_one_step(training_batch)
+
+            if self.ema and step >= self.ema_start_step:
+                self.ema.update(self.transformer)
 
             loss = training_batch.total_loss
             grad_norm = training_batch.grad_norm
@@ -717,9 +795,12 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     "step_time": step_time,
                     "avg_step_time": avg_step_time,
                     "grad_norm": grad_norm,
+                    "train/skipped_steps": self._skipped_steps,
                     "vsa_sparsity": current_vsa_sparsity,
                 }
                 if getattr(self.transformer, "dc_enabled", False):
+                    log_dict["dc/downsample_factor"] = getattr(
+                        self.transformer, "dc_downsample_factor", 0.0)
                     log_dict["dc/ratio_loss"] = getattr(training_batch, "dc_ratio_loss_val", 0.0)
                     ro = getattr(self.transformer, "last_routing_output", None)
                     if ro is not None:
@@ -739,6 +820,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     loss_parts = getattr(self.transformer, "_ratio_loss_components", None)
                     if loss_parts:
                         log_dict["dc/switch_loss"] = loss_parts["switch_loss"]
+                if self.ema:
+                    log_dict["ema/active"] = 1.0 if step >= self.ema_start_step else 0.0
                 wandb.log(log_dict, step=step)
 
             if step % self.training_args.checkpointing_steps == 0:
@@ -746,6 +829,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
                                 self.training_args.output_dir, step,
                                 self.optimizer, self.train_dataloader,
                                 self.lr_scheduler, self.noise_random_generator)
+                self._save_ema_checkpoint(step)
                 self.transformer.train()
                 self.sp_group.barrier()
 
@@ -755,6 +839,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
                         self.training_args.max_train_steps, self.optimizer,
                         self.train_dataloader, self.lr_scheduler,
                         self.noise_random_generator)
+        self._save_ema_checkpoint(self.training_args.max_train_steps)
 
         if get_sp_group():
             cleanup_dist_env_and_memory()

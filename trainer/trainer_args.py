@@ -616,8 +616,11 @@ class TrainingArgs(TrainerArgs):
     # diffusion setting
     ema_decay: float = 0.0
     ema_start_step: int = 0
+    dc_warmup_steps: int = 0
+    dc_warmup_start_factor: float = 1.5
     training_cfg_rate: float = 0.0
     precondition_outputs: bool = False
+    freeze_base_dit: bool = False
 
     # validation & logs
     validation_dataset_file: str = ""
@@ -818,6 +821,14 @@ class TrainingArgs(TrainerArgs):
                             type=int,
                             default=0,
                             help="Step to start EMA")
+        parser.add_argument("--dc-warmup-steps",
+                            type=int,
+                            default=0,
+                            help="Steps to linearly ramp dc_downsample_factor from start to target")
+        parser.add_argument("--dc-warmup-start-factor",
+                            type=float,
+                            default=1.5,
+                            help="Starting dc_downsample_factor for warmup")
         parser.add_argument("--training-cfg-rate",
                             type=float,
                             help="Classifier-free guidance scale")
@@ -825,6 +836,11 @@ class TrainingArgs(TrainerArgs):
             "--precondition-outputs",
             action=StoreBoolean,
             help="Whether to precondition the outputs of the model")
+        parser.add_argument(
+            "--freeze-base-dit",
+            action=StoreBoolean,
+            default=False,
+            help="Freeze base DiT weights and only train DC module params")
 
         # Validation and logging
         parser.add_argument("--validation-dataset-file",
