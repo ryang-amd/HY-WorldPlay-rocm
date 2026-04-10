@@ -25,6 +25,7 @@ import argparse
 import einops
 import imageio
 import json
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from PIL import Image, ImageDraw, ImageFont
@@ -747,6 +748,23 @@ def generate_video(args):
     if task == "i2v":
         extra_kwargs["reference_image"] = args.image_path
 
+    rank = int(os.environ.get("RANK", "0"))
+    profile_enabled = getattr(args, "profile", False)
+
+    profiler = None
+    if profile_enabled:
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_flops=True,
+        )
+        profiler.__enter__()
+
+    torch.cuda.synchronize()
+    t_start = time.perf_counter()
+
     out = pipe(
         enable_sr=enable_sr,
         prompt=args.prompt,
@@ -770,8 +788,26 @@ def generate_video(args):
         **extra_kwargs,
     )
 
+    torch.cuda.synchronize()
+    wall_clock_s = time.perf_counter() - t_start
+
+    tflops = None
+    if profiler is not None:
+        try:
+            profiler.__exit__(None, None, None)
+            total_flops = sum(evt.flops for evt in profiler.key_averages() if evt.flops and evt.flops > 0)
+            tflops = total_flops / 1e12
+        except RuntimeError as e:
+            rank0_log(f"Profiler stop failed (expected on ROCm/HIP): {e}", "WARN")
+            rank0_log("Wall-clock time is still valid; TFLOPs unavailable.", "WARN")
+
+    if rank == 0:
+        rank0_log(f"Wall-clock time: {wall_clock_s:.2f} s", "INFO")
+        if tflops is not None:
+            rank0_log(f"Total TFLOPs:    {tflops:.2f}", "INFO")
+
     # save video
-    if int(os.environ.get("RANK", "0")) == 0:
+    if rank == 0:
         output_path = args.output_path
         os.makedirs(output_path, exist_ok=True)
 
@@ -825,6 +861,21 @@ def generate_video(args):
                 import traceback
 
                 traceback.print_exc()
+
+        if profile_enabled:
+            results = {
+                "wall_clock_s": wall_clock_s,
+                "tflops": tflops,
+                "action_ckpt": getattr(args, "action_ckpt", None),
+                "action_base_ckpt": getattr(args, "action_base_ckpt", None),
+                "num_inference_steps": args.num_inference_steps,
+                "video_length": args.video_length,
+                "seed": args.seed,
+            }
+            results_path = os.path.join(output_path, "results.json")
+            with open(results_path, "w") as f:
+                json.dump(results, f, indent=2)
+            rank0_log(f"Results saved to: {results_path}", "INFO")
 
 
 def main():
@@ -1051,6 +1102,13 @@ def main():
         type=str,
         default="double_blocks",
         help="Include patterns for fp8 gemm (default: double_blocks)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="Enable torch.profiler for wall-clock time and TFLOPs measurement. "
+        "Writes results.json to output_path.",
     )
 
     args = parser.parse_args()

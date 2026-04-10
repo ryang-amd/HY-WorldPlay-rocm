@@ -41,7 +41,7 @@
     "dc_causal_smooth": false,
     "dc_use_ste": true,
     "dc_encoder_conditional": true,
-    "dc_ratio_loss_weight": 1.0,
+    "dc_ratio_loss_weight": 0.5,
     "dc_chunk_start_block": 10,
     "dc_chunk_end_block": 44,
 
